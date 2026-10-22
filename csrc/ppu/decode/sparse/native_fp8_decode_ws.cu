@@ -18,7 +18,7 @@ using Pipeline = flashmla::sparse_native_fp8::ws::Pipeline<DecodePolicy>;
 // WI = Warp-Interleave: overlap producer/consumer work using the shared-slot
 // handoff schedule implemented by produce() and consume() in the header.
 template <int D, int Stages, int BM, int Rows, bool Late = false, int Prefix = 0,
-    bool Dual = false, bool Gated = false, int GatherLanes = 0>
+    bool Dual = false, bool Gated = false, int GatherLanes = 0, bool PairedV = false>
 __global__ __launch_bounds__(2 * (BM / 16) * 4 * 32, BM <= 32 ? 2 : 1) void native_fp8_attention_kernel(
     const void *qraw, const F8 *kv, const int *ids, cutlass::bfloat16_t *out, float *maxima,
     float *lse, const float *sink, const int *lengths, float scale, float outscale, int width,
@@ -57,7 +57,8 @@ __global__ __launch_bounds__(2 * (BM / 16) * 4 * 32, BM <= 32 ? 2 : 1) void nati
     width = (tile_end - tile_begin) * 64;
     const int length = COOP_UNIF(max(0, min(width, global_length - tile_begin * 64)));
     extern __shared__ char bytes[];
-    State s = Pipeline::shared_state<D, Stages, BM, true>(bytes);
+    using AttentionPipeline = flashmla::sparse_native_fp8::ws::Pipeline<DecodePolicy, PairedV>;
+    State s = AttentionPipeline::template shared_state<D, Stages, BM, true>(bytes);
     auto sq = make_tensor(make_smem_ptr(s.q), LQ<D, BM>{});
     for (int i = tid; i < BM * (D / 16); i += Threads) {
         const int r = i / (D / 16), c = i % (D / 16) * 16;
@@ -105,7 +106,7 @@ __global__ __launch_bounds__(2 * (BM / 16) * 4 * 32, BM <= 32 ? 2 : 1) void nati
     }
     __ppu_barrier_sync(0, Threads, 15u);
     if (COOP_UNIF((role<BM>())) == 0) {
-        Pipeline::produce<D, Stages, BM, true, Prefix, Dual, false, GatherLanes>(
+        AttentionPipeline::template produce<D, Stages, BM, true, Prefix, Dual, false, GatherLanes>(
             s, kv, length, kvrows, scale, extra, primary_rows);
         __ppu_barrier_sync(0, Threads, 15u);
         const int gt = role_lane<BM>();
@@ -117,11 +118,12 @@ __global__ __launch_bounds__(2 * (BM / 16) * 4 * 32, BM <= 32 ? 2 : 1) void nati
                     heads, lse_queries, s.sum[gt] > 0 ? s.max[gt] + log2f(s.sum[gt] / 448.f) : -INFINITY);
         }
     } else
-        Pipeline::consume<D, Stages, BM, Rows, Late>(s, out, sink, length, outscale, active);
+        AttentionPipeline::template consume<D, Stages, BM, Rows, Late>(
+            s, out, sink, length, outscale, active);
 }
 
 template <int D, int ST, int BM, int Rows = 1, bool Late = false, int Prefix = 0,
-    bool Dual = false, bool Gated = false, int GatherLanes = 0>
+    bool Dual = false, bool Gated = false, int GatherLanes = 0, bool PairedV = false>
 void launch_attention(const void *q, const void *kv, const int *idx, void *out, float *mx, float *lse,
     const float *sink, const int *lengths, float scale, float os, int queries, int width,
     int kvrows, int heads, bool qbf, int qst, int qsh, hggcStream_t stream, int splits = 1,
@@ -129,7 +131,8 @@ void launch_attention(const void *q, const void *kv, const int *idx, void *out, 
     int primary_width = 0, int extra_width = 0, int primary_rows = 0, int lse_queries = 0,
     const int *errors = nullptr, int qpr = 1) {
     constexpr int Smem = Pipeline::smem_bytes<D, ST, BM, true>() + (Prefix ? BM * (D - Prefix * 32) - 24 : 0);
-    auto kernel = native_fp8_attention_kernel<D, ST, BM, Rows, Late, Prefix, Dual, Gated, GatherLanes>;
+    auto kernel = native_fp8_attention_kernel<D, ST, BM, Rows, Late, Prefix,
+        Dual, Gated, GatherLanes, PairedV>;
     hggcFuncSetAttribute(kernel, hggcFuncAttributeMaxDynamicSharedMemorySize, Smem);
     kernel<<<dim3(int64_t(queries) * splits * ((heads + BM - 1) / BM)), 2 * (BM / 16) * 4 * 32, Smem, stream>>>(
         q, static_cast<const F8 *>(kv), idx, static_cast<cutlass::bfloat16_t *>(out), mx, lse, sink,
@@ -163,6 +166,14 @@ void dispatch_attention(bool two_stage, const void *q, const void *kv, const int
             width / splits >= MinWideGatherTiles * flashmla::sparse_native_fp8::TileKeys)) {
         launch = two_stage ? launch_attention<D, 2, BM, 1, false, Prefix, Dual, Gated, 8>
                            : launch_attention<D, 3, BM, 1, false, Prefix, Dual, Gated, 8>;
+        if constexpr (!Dual && !Gated) {
+            // M890P measurements favor the paired transpose at 32 key tiles.
+            // Short partitions keep the original V fragments.
+            constexpr int MinPairedVTiles = 32;
+            if (splits == 1 && width >= MinPairedVTiles * flashmla::sparse_native_fp8::TileKeys)
+                launch = two_stage ? launch_attention<D, 2, BM, 1, false, Prefix, false, false, 8, true>
+                                   : launch_attention<D, 3, BM, 1, false, Prefix, false, false, 8, true>;
+        }
     }
     launch(q, kv, idx, out, maxima, lse, sink, lengths, scale, out_scale, queries, width, kv_rows,
         heads, q_bf16, q_stride_t, q_stride_h, stream, splits, extra, extra_indices, extra_lengths,
@@ -176,13 +187,17 @@ __global__ __launch_bounds__(2 * (BM / 16) * 4 * 32, BM <= 32 ? 2 : 1) void nati
     const F8 *kv, const int *ids, const unsigned *masks, cutlass::bfloat16_t *out, float *maxima,
     float *lse, const float *sink, const int *errors, float scale, int width, int kvrows, int qpr,
     const F8 *extra, int primary_rows, int lse_queries) {
+    // Qualify the native single-KV folded path independently of BF16-query
+    // compatibility, short windows and dual-KV verification.
+    using VerifyPipeline = flashmla::sparse_native_fp8::ws::Pipeline<DecodePolicy,
+        !QB && !Dual && !Window && (BM >= 32)>;
     constexpr int G = (BM / 16) * 4 * 32, Threads = 2 * G;
     const int batch = blockIdx.x, head = blockIdx.y * BM, heads = qpr * H,
               active = min(BM, heads - head), tid = threadIdx.x;
     if (errors[batch])
         return;
     extern __shared__ char bytes[];
-    State state = Pipeline::shared_state<D, ST, BM, true>(bytes);
+    State state = VerifyPipeline::template shared_state<D, ST, BM, true>(bytes);
     auto sq = make_tensor(make_smem_ptr(state.q), LQ<D, BM>{});
     for (int i = tid; i < BM * (D / 16); i += Threads) {
         const int r = i / (D / 16), c = i % (D / 16) * 16;
@@ -210,7 +225,7 @@ __global__ __launch_bounds__(2 * (BM / 16) * 4 * 32, BM <= 32 ? 2 : 1) void nati
     }
     __ppu_barrier_sync(0, Threads, 15u);
     if (COOP_UNIF((role<BM>())) == 0) {
-        Pipeline::produce<D, ST, BM, true, 0, Dual, true>(state, kv, width, kvrows,
+        VerifyPipeline::template produce<D, ST, BM, true, 0, Dual, true>(state, kv, width, kvrows,
             scale, extra, primary_rows, masks + (long)batch * qpr * (width / 32), width / 32, H, head,
             heads);
         __ppu_barrier_sync(0, Threads, 15u);
@@ -224,7 +239,8 @@ __global__ __launch_bounds__(2 * (BM / 16) * 4 * 32, BM <= 32 ? 2 : 1) void nati
                 (head + gt) % H, H, lse_queries, value);
         }
     } else
-        Pipeline::consume<D, ST, BM, 1, true, Window ? H : 0>(state, out + ((long)batch * heads + head) * 512,
+        VerifyPipeline::template consume<D, ST, BM, 1, true, Window ? H : 0>(
+            state, out + ((long)batch * heads + head) * 512,
             sink ? sink + (Window ? 0 : head) : nullptr, width, 1.f, active);
 }
 template <int D, int H, bool QB, bool Dual = false, bool Window = false, int BM = 64>

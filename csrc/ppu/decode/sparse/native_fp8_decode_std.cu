@@ -129,7 +129,12 @@ void launch_native_d512_dual_compact(const void *q, const void *kv, const int *i
     constexpr int BM = Heads == 64 ? 64 : 16;
     constexpr int Prefix = Heads == 16 ? 8 : 4;
     constexpr int Shared = (BM + 128) * 512 + BM * 64 + 2176 * 4 + 11 * BM * 4 + 256;
-    auto kernel = flash_fwd_sparse_fp8_std_kernel<BM, 512, false, 256, Prefix, GuardRequests, Heads, 64, true>;
+    // Full head tiles favor one gather pass over all 64 keys: four lanes
+    // copy each row in 16-byte segments. Compact tiles retain their tuned
+    // eight-lane gather; changing the load grouping does not change QK/PV.
+    constexpr int GatherLanes = Heads == 64 ? 4 : 8;
+    auto kernel = flash_fwd_sparse_fp8_std_kernel<BM, 512, false, 256, Prefix,
+        GuardRequests, Heads, 64, true, GatherLanes>;
     hggcFuncSetAttribute(kernel, hggcFuncAttributeMaxDynamicSharedMemorySize, Shared);
     kernel<<<dim3(int64_t(queries) * (Heads == 64 ? runtime_heads / 64 : 1)), 256, Shared, stream>>>(q, static_cast<const E4M3 *>(kv), idx,
         static_cast<cutlass::bfloat16_t *>(out), scale, (width + extra_width) / 64, primary_rows + extra_rows,

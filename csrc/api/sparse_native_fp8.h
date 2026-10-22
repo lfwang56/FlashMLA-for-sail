@@ -396,7 +396,7 @@ at::Tensor native_fp8_lse_to_natural(const at::Tensor &lse, int64_t batch, int64
     CHECK_DEVICE(lse);
     CHECK_CONTIGUOUS(lse);
     TORCH_CHECK(lse.dim() == 2 && lse.scalar_type() == torch::kFloat32 && batch >= 0 &&
-                    queries > 0 && batch * queries == lse.size(0),
+                    queries >= 0 && batch * queries == lse.size(0),
         "native LSE expects contiguous FP32 [batch*queries,heads]");
     at::cuda::CUDAGuard guard(lse.device());
     auto out = torch::empty({batch, lse.size(1), queries}, lse.options());
