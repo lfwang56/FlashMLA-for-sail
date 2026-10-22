@@ -165,6 +165,8 @@ std::vector<at::Tensor> sparse_prefill_fp8_fwd(
         "sparse_prefill_fp8_fwd: h_q must be divisible by heads per group");
     TORCH_CHECK(!fused_epilogue || !compute_aux,
         "sparse_prefill_fp8_fwd: fused output requires compute_aux=False");
+    TORCH_CHECK(!fused_epilogue || !out_opt.has_value(),
+        "sparse_prefill_fp8_fwd: fused output requires out=None; consume out_fp8 and out_scale");
     TORCH_CHECK(out_static_scale == 0.0 || out_static_scale == 1.0 / 16.0,
         "sparse_prefill_fp8_fwd: out_static_scale must be None or 1/16");
     TORCH_CHECK(out_static_scale == 0.0 || fused_epilogue,
@@ -191,9 +193,10 @@ std::vector<at::Tensor> sparse_prefill_fp8_fwd(
     if (out_opt.has_value())
         CHECK_SHAPE(out_opt.value(), s_q, h_q, (int)d_v);
     auto opts = q.options();
-    at::Tensor out = out_opt.has_value()
-                         ? out_opt.value()
-                         : torch::empty({s_q, h_q, (int)d_v}, opts.dtype(torch::kBFloat16));
+    // The fused epilogue writes only out_fp8/out_fp8_scale; no BF16 output is materialized.
+    at::Tensor out = fused_epilogue ? torch::empty({0}, opts.dtype(torch::kBFloat16))
+                    : out_opt.has_value() ? out_opt.value()
+                                         : torch::empty({s_q, h_q, (int)d_v}, opts.dtype(torch::kBFloat16));
     at::Tensor max_logits = compute_aux ? torch::empty({s_q, h_q}, opts.dtype(torch::kFloat32))
                                         : torch::empty({0}, opts.dtype(torch::kFloat32));
     at::Tensor lse = compute_aux ? torch::empty({s_q, h_q}, opts.dtype(torch::kFloat32))

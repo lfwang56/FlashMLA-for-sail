@@ -72,6 +72,11 @@ preallocated BF16 output, and an additional E4M3 cache. Direct APIs return
 base-2 LSE and `-inf` for empty rows; the paged API returns natural LSE and
 `+inf` for empty rows. Empty attention outputs are zero.
 
+When `flash_mla_sparse_fp8_fwd` receives `out_fp8`, the fused inverse-RoPE/FP8
+epilogue writes only the supplied `out_fp8` and `out_scale` buffers. This mode
+requires `out=None` and `compute_aux=False`, and returns three empty tensors
+with shape `[0]`; callers must consume the supplied FP8 buffers.
+
 Decode scheduling is internal: callers do not pass `num_cta`. Split counts
 follow the device's CU count and query/head work, with full-head tiled kernels
 for sufficiently large grids. The variable-query D512/D576 verify specialization
