@@ -1571,7 +1571,7 @@ flash_fwd_splitkv_mla_kernel(__grid_constant__ const Flash_fwd_mla_params params
             __mbarrier_init(&barriers_K1[i], 32);
         }
     }
-    __syncthreads(); // Publish initialized barriers before any producer arrives.
+    __syncthreads();
     bool cur_phase_Q = 0, cur_phase_K0 = 0, cur_phase_K1 = 0;
 
     int *tile_scheduler_metadata_ptr = params.tile_scheduler_metadata_ptr + partition_idx * TileSchedulerMetaDataSize;
@@ -1785,14 +1785,8 @@ flash_fwd_splitkv_mla_kernel(__grid_constant__ const Flash_fwd_mla_params params
         }
         else
         {
-            if (idx_in_warpgroup % 4 == 0)
-            {
-                sL_reduction_wksp[my_row] += rL[0];
-                sL_reduction_wksp[my_row + 8] += rL[1];
-            }
-            __syncwarp();
-            rL[0] = sL_reduction_wksp[my_row];
-            rL[1] = sL_reduction_wksp[my_row + 8];
+            rL[0] = sL_reduction_wksp[my_row] + rL[0];
+            rL[1] = sL_reduction_wksp[my_row + 8] + rL[1];
         }
 
         // Prune out when rL is 0.0f or NaN
@@ -1828,7 +1822,7 @@ flash_fwd_splitkv_mla_kernel(__grid_constant__ const Flash_fwd_mla_params params
             int i = threadIdx.x;
             if (i < num_valid_seq_q)
             {
-                float cur_L = sL_reduction_wksp[i];
+                float cur_L = sL_reduction_wksp[i] + sL_reduction_wksp[i + T::BLOCK_SIZE_M];
                 gSoftmaxLse(i) = (cur_L == 0.0f || cur_L != cur_L) ? INFINITY : logf(cur_L) + sM(i) / (float)M_LOG2E;
             }
         }
@@ -1849,9 +1843,11 @@ flash_fwd_splitkv_mla_kernel(__grid_constant__ const Flash_fwd_mla_params params
             int i = threadIdx.x;
             if (i < num_valid_seq_q)
             {
-                float cur_L = sL_reduction_wksp[i];
+                float cur_L = sL_reduction_wksp[i] + sL_reduction_wksp[i + T::BLOCK_SIZE_M];
                 gSoftmaxLseAccum(i) = (cur_L == 0.0f || cur_L != cur_L) ? -INFINITY : log2f(cur_L) + sM(i);
             }
+
+            __syncthreads();  // Finish LSE reads before output staging overwrites sL/sM.
 
             store_o<T, false>(rO, gOAccum, rL, sO_addr, params, batch_idx, k_head_idx, m_block_idx, num_valid_seq_q, warpgroup_idx, idx_in_warpgroup);
 
@@ -1869,7 +1865,7 @@ flash_fwd_splitkv_mla_kernel(__grid_constant__ const Flash_fwd_mla_params params
                         __mbarrier_init(&barriers_K1[i], 32);
                     }
                 }
-                __syncthreads(); // Publish reinitialized barriers before the next Q copy.
+                __syncthreads();
                 cur_phase_Q = 0, cur_phase_K0 = 0, cur_phase_K1 = 0;
                 launch_q_copy<T>(params, batch_idx + 1, m_block_idx, k_head_idx, sQ, tidx, warp_idx, barrier_Q);
             }

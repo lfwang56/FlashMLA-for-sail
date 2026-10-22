@@ -481,20 +481,26 @@ def test_fused_output_rope_token_offset(static_scale, storage_offset):
             )
         torch.cuda.synchronize()
         return
-    native(
-        "prefill",
-        q,
-        kv,
-        ids,
-        compute_aux=False,
-        out_rope_freqs_cis=freqs,
-        out_rope_positions=positions,
-        out_fp8=out8,
-        out_scale=scales,
-        out_quant_heads_per_group=8,
-        out_token_offset=offset,
-        out_static_scale=static_scale,
-    )
+    def call(out=None):
+        return native(
+            "prefill", q, kv, ids, out=out, compute_aux=False,
+            out_rope_freqs_cis=freqs, out_rope_positions=positions,
+            out_fp8=out8, out_scale=scales, out_quant_heads_per_group=8,
+            out_token_offset=offset, out_static_scale=static_scale,
+        )
+
+    unused_out = torch.full_like(plain, 123)
+    with pytest.raises(RuntimeError, match="fused output requires out=None"):
+        call(out=unused_out)
+    assert (unused_out == 123).all()
+    assert (out8.view(torch.uint8) == 0).all() and (scales == -1).all()
+
+    result = call()
+    assert all(t.shape == (0,) and t.device == q.device for t in result)
+    assert [t.dtype for t in result] == [torch.bfloat16, torch.float32, torch.float32]
+    graph, result = capture(call)
+    graph.replay()
+    assert all(t.shape == (0,) for t in result)
     torch.cuda.synchronize()
     torch.testing.assert_close(
         scales[:, offset : offset + b], scale, atol=2e-6, rtol=2e-5

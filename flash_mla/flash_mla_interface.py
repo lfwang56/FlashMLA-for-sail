@@ -379,7 +379,7 @@ def flash_mla_sparse_fp8_fwd(
             For BF16 KV, omitted lengths are derived from the last valid column,
             retaining valid entries after holes or an unpooled sparse tail.
         out: optional preallocated contiguous [s_q, h_q, 512] bfloat16 output,
-            with a 16-byte-aligned base address.
+            with a 16-byte-aligned base address. Must be None when out_fp8 is supplied.
         compute_aux: whether to materialize max_logits and lse. Set False when the
             caller only consumes output; returned aux tensors then have shape [0].
         trusted_full_topk: certifies that every index before ``topk_length`` is in
@@ -388,17 +388,20 @@ def flash_mla_sparse_fp8_fwd(
             is slot-masked. The default is False and preserves support for arbitrary
             invalid indices anywhere in the active prefix, including length-full
             rows.
-        Fused inverse-RoPE/FP8 output arguments retain their existing contract and
-            require contiguous Q, h_q divisible by 64, topk <= 2048, and
-            a 2-byte-aligned out_fp8 base address.
+        Fused inverse-RoPE/FP8 output writes directly to out_fp8 and out_scale.
+            It requires contiguous Q, h_q divisible by 64, topk <= 2048,
+            a 2-byte-aligned out_fp8 base address, out=None, and compute_aux=False.
+            Callers must consume these supplied buffers; all three returned
+            tensors are empty sentinels with shape [0].
 
     Returns:
         (output, max_logits, lse)
-        - output: [s_q, h_q, d_v], bfloat16
+        - output: [s_q, h_q, d_v], bfloat16; shape [0] in fused output mode.
         - max_logits: [s_q, h_q], float. The ceil-quantised running max used internally,
             i.e. an upper bound on the true max rather than the max itself.
+            Shape [0] when compute_aux=False.
         - lse: [s_q, h_q], float, base-2 log-sum-exp of quantized QK scores,
-            computed in FP32 before attention-sink scaling.
+            computed in FP32 before attention-sink scaling. Shape [0] when compute_aux=False.
     """
     return flash_mla_cuda.sparse_prefill_fp8_fwd(
         q,
