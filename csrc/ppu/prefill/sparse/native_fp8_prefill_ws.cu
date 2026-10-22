@@ -5,7 +5,7 @@
 
 namespace flashmla_fp8_prefill_ws {
 using namespace flashmla::sparse_native_fp8::ws;
-using Pipeline = flashmla::sparse_native_fp8::ws::Pipeline<PrefillPolicy>;
+using Pipeline = flashmla::sparse_native_fp8::ws::Pipeline<PrefillPolicy, true>;
 template <int D, int Stages, int BM, bool ReuseQ>
 __global__ __launch_bounds__(2 * (BM / 16) * 4 * 32,
     BM == 32 ? 2 : 1) void flash_sparse_fp8_prefill_ws_kernel(const F8 *__restrict__ q,

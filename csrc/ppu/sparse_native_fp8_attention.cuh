@@ -14,6 +14,7 @@
 #include <cutlass/numeric_conversion.h>
 #include <cutlass/numeric_types.h>
 #include <cstring>
+#include <type_traits>
 #ifdef USE_PPU
 #include "ppu/ppu_include.hpp"
 #endif
@@ -669,10 +670,69 @@ template <int BM> using LP = decltype(tile_to_shape(Atom{}, Shape<Int<BM>, _64>{
 template <int BM>
 using MQ = TiledMMA<MMA_Atom<PPU0015_16x16x32_F32E4M3E4M3F32_TN>,
     Layout<Shape<Int<BM / 16>, _4, _1>>, Tile<Int<BM>, _64, _32>>;
-template <int BM, int Rows = 1>
+template <int BM, int Rows = 1, bool PairedV = false>
 using MP = TiledMMA<MMA_Atom<PPU0015_16x16x32_F32E4M3E4M3F32_TN>,
     Layout<Shape<Int<Rows>, Int<BM / (4 * Rows)>, _1>>,
-    Tile<Int<16 * Rows>, Int<BM * 4 / Rows>, _32>>;
+    Tile<Int<16 * Rows>,
+        std::conditional_t<PairedV,
+            Layout<Shape<_16, Int<BM / (4 * Rows)>, _2>, Stride<_1, _32, _16>>,
+            Int<BM * 4 / Rows>>, _32>>;
+
+// A b16 transpose moves pairs of FP8 bytes, not individual FP8 elements.
+// Keep its fragment order through PV instead of restoring the scalar-load
+// layout with lane shuffles. P's reduction columns and the output columns
+// must use the matching permutations below.
+struct PairedVLoad {
+    __device__ __forceinline__ static int column(int value) {
+        // Rotate bits [3:1] within each 16-column group. Bit 0 is preserved
+        // so adjacent FP8 probabilities and packed BF16 output pairs stay together.
+        return (value & ~14) | ((value & 6) << 1) | ((value & 8) >> 2);
+    }
+
+    template <int Half>
+    __device__ __forceinline__ static void unpack(uint32_t *dst,
+        const uint32_t (&lo)[4], const uint32_t (&hi)[4]) {
+        static_assert(Half == 0 || Half == 1);
+        // Separate even/odd bytes from the two transposed row blocks.
+        dst[0] = __byte_perm(lo[2 * Half], lo[2 * Half + 1], 0x6420u);
+        dst[1] = __byte_perm(hi[2 * Half], hi[2 * Half + 1], 0x6420u);
+        dst[2] = __byte_perm(lo[2 * Half], lo[2 * Half + 1], 0x7531u);
+        dst[3] = __byte_perm(hi[2 * Half], hi[2 * Half + 1], 0x7531u);
+    }
+
+    __device__ __forceinline__ static void load(uint32_t *first, uint32_t *second,
+        const F8 *base, int col, int k) {
+        // A 64-row tile uses 8x64-byte swizzled atoms. Addresses are in
+        // 16-byte units; the two loads cover K32 x N32, shared by two N16
+        // fragments. col is a warp-uniform multiple of 32.
+        const int address = COOP_UNIF(int(reinterpret_cast<uintptr_t>(base) / 16) +
+            (col / 64) * 256 + (col % 64) / 16 + k * 128);
+        uint32_t lo[4], hi[4];
+        asm volatile("ppu.tc02.ldmatrix.swzl.sync.bulk.tensor.m8n8.x4.b16.trans "
+                     "{%0,%1,%2,%3}, [%4], %5,%6,%7;"
+            : "=r"(lo[0]), "=r"(lo[1]), "=r"(lo[2]), "=r"(lo[3])
+            : "l"(address), "r"(1), "r"(32), "n"(1));
+        asm volatile("ppu.tc02.ldmatrix.swzl.sync.bulk.tensor.m8n8.x4.b16.trans "
+                     "{%0,%1,%2,%3}, [%4], %5,%6,%7;"
+            : "=r"(hi[0]), "=r"(hi[1]), "=r"(hi[2]), "=r"(hi[3])
+            : "l"(address + 64), "r"(1), "r"(32), "n"(1));
+        unpack<0>(first, lo, hi);
+        unpack<1>(second, lo, hi);
+    }
+
+    template <class Tensor>
+    __device__ __forceinline__ static void restore_output(Tensor &acc) {
+        // Restore adjacent output pairs before the packed BF16 stores.
+        CUTE_UNROLL
+        for (int i = 0; i < size(acc); i += 8) {
+            const float a = acc(i + 1), b = acc(i + 3);
+            acc(i + 1) = acc(i + 4);
+            acc(i + 4) = a;
+            acc(i + 3) = acc(i + 6);
+            acc(i + 6) = b;
+        }
+    }
+};
 struct State {
     F8 *q, *k, *p;
     float *max, *sum, *alpha, *pmax, *psum;
@@ -704,7 +764,7 @@ struct DecodePolicy {
     static constexpr int IndexPadding = 4;
 };
 
-template <typename Policy>
+template <typename Policy, bool PairedV = false>
 struct Pipeline {
     template <int D, int Stages, int BM, bool ReuseQ> static constexpr int smem_bytes() {
         return (ReuseQ ? 0 : BM * D) + Stages * N * D + 2 * BM * N +
@@ -947,6 +1007,7 @@ struct Pipeline {
             }
             float sums[2] = {0, 0};
             auto cp = tq.partition_C(sp);
+            auto pxy = tq.partition_C(make_identity_tensor(Shape<Int<BM>, _64>{}));
             CUTE_UNROLL
             for (int e = 0; e < 8; e += 2) {
                 const int which = (e >> 1) & 1;
@@ -954,7 +1015,10 @@ struct Pipeline {
                 const float a = exp2f(fmaf(scores(e), scale, bias)),
                             b = exp2f(fmaf(scores(e + 1), scale, bias));
                 sums[which] += a + b;
-                *reinterpret_cast<__hg_fp8x2_storage_t *>(&cp(e)) =
+                auto *dst = &cp(e);
+                if constexpr (PairedV)
+                    dst = &sp(get<0>(pxy(e)), PairedVLoad::column(int(get<1>(pxy(e)))));
+                *reinterpret_cast<__hg_fp8x2_storage_t *>(dst) =
                     flashmla::sparse_native_fp8::pack_e4m3_pair(make_float2(a, b));
             }
             CUTE_UNROLL
@@ -1000,7 +1064,7 @@ struct Pipeline {
         const int gt = role_lane<BM>(), lane = gt % 32, warp = COOP_UNIF(gt / 32),
                   mi = lane / 4;
         const int tiles = max(1, (length + N - 1) / N);
-        MP<BM, Rows> mp;
+        MP<BM, Rows, PairedV> mp;
         auto tp = mp.get_slice(gt);
         auto shape = make_tensor(make_smem_ptr(s.k), Shape<Int<BM>, _512>{}, GenRowMajor{});
         auto acc = tp.partition_fragment_C(shape);
@@ -1036,16 +1100,27 @@ struct Pipeline {
             const int pt = COOP_UNIF(
                 int(reinterpret_cast<uintptr_t>(s.p + slot * M * N) / 16) + (warp % Rows) * 64);
             auto load = [&](int k) {
-                CUTE_UNROLL
-                for (int n = 0; n < V / (G / (2 * Rows)); n++) {
-                    const auto *vp =
-                        reinterpret_cast<const unsigned char *>(s.k + (t % Stages) * N * D) +
-                        n * (G / (2 * Rows)) * N + k * 2048 + voff;
-                    auto *r = reinterpret_cast<uint32_t *>(&rv(0, n, Late ? 0 : k));
-                    r[0] = ppu_mat_trans_b8(*reinterpret_cast<const uint32_t *>(vp));
-                    r[1] = ppu_mat_trans_b8(*reinterpret_cast<const uint32_t *>(vp + 1024));
-                    r[2] = ppu_mat_trans_b8(*reinterpret_cast<const uint32_t *>(vp + 8));
-                    r[3] = ppu_mat_trans_b8(*reinterpret_cast<const uint32_t *>(vp + 1032));
+                if constexpr (PairedV) {
+                    CUTE_UNROLL
+                    for (int n = 0; n < V / (G / (2 * Rows)); n += 2) {
+                        PairedVLoad::load(
+                            reinterpret_cast<uint32_t *>(&rv(0, n, Late ? 0 : k)),
+                            reinterpret_cast<uint32_t *>(&rv(0, n + 1, Late ? 0 : k)),
+                            s.k + (t % Stages) * N * D,
+                            (warp / Rows) * 32 + (n / 2) * (G / Rows), k);
+                    }
+                } else {
+                    CUTE_UNROLL
+                    for (int n = 0; n < V / (G / (2 * Rows)); n++) {
+                        const auto *vp =
+                            reinterpret_cast<const unsigned char *>(s.k + (t % Stages) * N * D) +
+                            n * (G / (2 * Rows)) * N + k * 2048 + voff;
+                        auto *r = reinterpret_cast<uint32_t *>(&rv(0, n, Late ? 0 : k));
+                        r[0] = ppu_mat_trans_b8(*reinterpret_cast<const uint32_t *>(vp));
+                        r[1] = ppu_mat_trans_b8(*reinterpret_cast<const uint32_t *>(vp + 1024));
+                        r[2] = ppu_mat_trans_b8(*reinterpret_cast<const uint32_t *>(vp + 8));
+                        r[3] = ppu_mat_trans_b8(*reinterpret_cast<const uint32_t *>(vp + 1032));
+                    }
                 }
                 CUTE_UNROLL
                 for (int m = 0; m < M / (16 * Rows); m++)
@@ -1087,6 +1162,8 @@ struct Pipeline {
             }
             inv[j] = (sum > 0 && sum == sum) ? outscale / sum : 0.f;
         }
+        if constexpr (PairedV)
+            PairedVLoad::restore_output(acc);
         CUTE_UNROLL
         for (int e = 0; e < size(acc); e += 2) {
             if constexpr (!Policy::FullHeadTile) {
@@ -1097,7 +1174,9 @@ struct Pipeline {
             cutlass::bfloat16_t a(acc(e) * f), b(acc(e + 1) * f);
             uint32_t packed = uint32_t(reinterpret_cast<uint16_t &>(a)) |
                               (uint32_t(reinterpret_cast<uint16_t &>(b)) << 16);
-            *reinterpret_cast<uint32_t *>(out + get<0>(xy(e)) * V + get<1>(xy(e))) = packed;
+            const int col = int(get<1>(xy(e)));
+            *reinterpret_cast<uint32_t *>(out + get<0>(xy(e)) * V +
+                (PairedV ? PairedVLoad::column(col) : col)) = packed;
         }
     }
 };

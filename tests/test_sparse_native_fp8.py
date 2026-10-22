@@ -167,6 +167,32 @@ def test_uint8_empty_and_optional_statistics(kind):
         torch.testing.assert_close(noaux[0], plain[0], atol=0, rtol=0)
 
 
+@pytest.mark.parametrize("dim", [512, 576])
+@pytest.mark.parametrize("path", ["prefill_half", "prefill_full", "decode"])
+def test_ws_value_column_order(path, dim):
+    """One valid key exposes V fragment permutations without softmax error."""
+    cu = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
+    decode = path == "decode"
+    queries = 2 * cu if decode else (cu if path == "prefill_full" else 1)
+    heads, width = (16, 2048) if decode else (64, 128)
+    q = torch.zeros(queries, heads, dim, device="cuda", dtype=torch.float8_e4m3fn)
+    # Different values in adjacent columns and N16 fragments make a swapped
+    # byte, fragment or packed output pair observable in the final output.
+    kv = torch.linspace(-4, 4, dim, device="cuda").to(q.dtype).reshape(1, 1, dim)
+    ids = torch.full((queries, 1, width), -1, device="cuda", dtype=torch.int32)
+    ids[:, :, 0] = 0
+
+    def call():
+        return native("decode" if decode else "prefill", q, kv, ids)
+
+    graph, result = capture(call)
+    for sign in (1, -1):
+        kv.copy_((sign * torch.linspace(-4, 4, dim, device="cuda")).to(q.dtype).reshape_as(kv))
+        graph.replay()
+        expected = kv[0, 0, :512].to(torch.bfloat16).expand_as(result[0])
+        torch.testing.assert_close(result[0], expected, atol=0, rtol=0)
+
+
 @pytest.mark.parametrize("kind", ["decode", "prefill"])
 @pytest.mark.parametrize(
     "field,value",
@@ -832,9 +858,13 @@ def test_window_union_masks_and_fallback_replay(queries, heads, extra_width, fla
 
 
 @pytest.mark.parametrize("batch,queries", [(0, 1), (4, 0)])
-@pytest.mark.parametrize("extra_width", [0, 512])
-def test_native_paged_empty_query_axes(batch, queries, extra_width):
-    heads, dim, width = 8, 512, 128
+@pytest.mark.parametrize(
+    "dim,width,extra_width",
+    [(512, 128, 0), (512, 128, 512), (576, 128, 0), (576, 128, 512), (512, 2048, 512)],
+)
+def test_native_paged_empty_query_axes(batch, queries, dim, width, extra_width):
+    # D576 and D512 with combined width > 2048 use the two-decode/merge fallback.
+    heads = 8
     q = torch.empty(batch, queries, heads, dim, device="cuda", dtype=torch.float8_e4m3fn)
     kv = torch.empty(128, 1, 1, dim, device="cuda", dtype=q.dtype)
     indices = torch.empty(batch, queries, width, device="cuda", dtype=torch.int32)
@@ -846,6 +876,21 @@ def test_native_paged_empty_query_axes(batch, queries, extra_width):
     )
     assert output.shape == (batch, queries, heads, 512)
     assert lse.shape == (batch, heads, queries)
+
+
+@pytest.mark.parametrize("queries", [131071, 131072])
+def test_prefill_two_head_groups_large_grid(queries):
+    # H128/topk128 uses paired-query ordering with grid.y=65536, which the
+    # PPU supports. Exercise both the odd-Q bounds check and the even-Q path.
+    heads, dim, width = 128, 512, 128
+    q = torch.zeros(queries, heads, dim, device="cuda", dtype=torch.float8_e4m3fn)
+    kv = torch.zeros(1, 1, dim, device="cuda", dtype=q.dtype)
+    ids = torch.full((queries, 1, width), -1, device="cuda", dtype=torch.int32)
+    lengths = torch.zeros(queries, device="cuda", dtype=torch.int32)
+    out = torch.full((queries, heads, 512), torch.nan, device="cuda", dtype=torch.bfloat16)
+    result = native("prefill", q, kv, ids, topk_length=lengths, out=out)
+    assert result[0].data_ptr() == out.data_ptr()
+    assert (result[0] == 0).all() and torch.isneginf(result[-1]).all()
 
 
 @pytest.mark.parametrize("width,extra_width", [(128, 0), (512, 0), (128, 512)])
