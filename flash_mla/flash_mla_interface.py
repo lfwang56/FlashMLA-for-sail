@@ -4,7 +4,7 @@ import dataclasses
 import torch
 
 import flash_mla_cuda
-from . import _sparse_native_fp8
+from flash_mla_cuda import QuantizedAttentionConfig
 
 @dataclasses.dataclass
 class FlashMLASchedMeta:
@@ -97,11 +97,13 @@ def flash_mla_with_kvcache(
     extra_topk_length: Optional[torch.Tensor] = None,
     out: Optional[torch.Tensor] = None,
     enable_batch_invariant: bool = False,
-    num_queries_per_request: Optional[int] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Arguments:
         q: (batch_size, seq_len_q, num_heads_q, head_dim).
+            Native FP8 uses seq_len_q for request-level KV reuse. Flattened
+            (batch_size * seq_len_q, 1, num_heads_q, head_dim) inputs are supported
+            as independent queries.
         k_cache: (num_blocks, page_block_size, num_heads_k, head_dim).
                 Different modes (including fp8/bf16, sparsity, and model version (i.e. V3.2 or MODEL1)) has different KV cache layouts. See comments below for details.
                 The KV cache must be contiguously valid for sparse attention on sm100. Here "contiguously valid" means that every byte, from the very beginning of the KV cache, till the last byte in the KV cache, is valid memory address to visit (i.e. won't IMA). In other words, the KV cache could be a slice of a larger array, but cannot be a list of disjoint memory blocks.
@@ -112,9 +114,6 @@ def flash_mla_with_kvcache(
         cache_seqlens: (batch_size), torch.int32. Can be None when sparse attention is used.
         head_dim_v: Head_dim of v. Must be 512
         tile_scheduler_metadata: FlashMLASchedMeta, return by get_mla_metadata. You may reuse the same sched_meta across different invocations, but only when the tensor shapes and the values of cache_seqlens, topk_length, and extra_topk_length remain the same.
-        num_queries_per_request: Optional explicit request grouping for native FP8
-            Q flattened as [B*S,1,H,D]. Use S; grouped [B,S,H,D] infers it.
-            This controls KV-reuse dispatch without assuming a fixed draft count.
         num_splits placeholder: must be "None" (to be compatible with the old interface).
         softmax_scale: float. The scaling of QK^T before applying softmax. Default to 1 / sqrt(head_dim_k).
         causal: bool. Whether to apply causal attention mask. Only valid for dense attention
@@ -131,6 +130,7 @@ def flash_mla_with_kvcache(
             dtype. If provided, results are written into this buffer to avoid
             allocation. Dense attention supports only num_heads_k == 1 (MLA).
         enable_batch_invariant: Disable sparse split-KV so results do not depend on batch partitioning.
+            Not supported for native FP8 attention.
 
     For DeepSeek V3, DeepSeek V3.1, and DeepSeek V3.2:
         head_dim should be 576 while head_dim_v should be 512.
@@ -151,56 +151,8 @@ def flash_mla_with_kvcache(
         out: (batch_size, seq_len_q, num_heads_q, head_dim_v).
         softmax_lse: (batch_size, num_heads_q, seq_len_q), torch.float32.
     """
-    # Packed FP8 caches may also expose an E4M3 view, but include scale/rope
-    # storage beyond D. Only a flat, dimension-matched cache uses native Q8/KV8.
-    if (
-        indices is not None
-        and k_cache.dtype == torch.float8_e4m3fn
-        and k_cache.shape[-1] == q.shape[-1]
-    ):
-        return _sparse_native_fp8.paged_attention(
-            flash_mla_cuda,
-            flash_mla_sparse_decode_fp8_fwd,
-            q,
-            k_cache,
-            head_dim_v,
-            softmax_scale,
-            causal,
-            indices,
-            attn_sink,
-            extra_k_cache,
-            extra_indices_in_kvcache,
-            topk_length,
-            extra_topk_length,
-            out,
-            num_queries_per_request,
-        )
-
     sched_meta = tile_scheduler_metadata
     indices_in_kvcache = indices
-    if isinstance(sched_meta, torch.Tensor):
-        # Preserve caller-provided schedules.
-        assert indices is not None and not causal, (
-            "raw metadata requires sparse attention"
-        )
-        assert isinstance(num_splits, torch.Tensor), "raw metadata requires num_splits"
-        scale = q.shape[-1] ** (-0.5) if softmax_scale is None else softmax_scale
-        result = flash_mla_cuda.sparse_decode_fwd(
-            q,
-            k_cache,
-            head_dim_v,
-            indices,
-            attn_sink,
-            topk_length,
-            sched_meta,
-            num_splits,
-            extra_k_cache,
-            extra_indices_in_kvcache,
-            extra_topk_length,
-            scale,
-            out,
-        )
-        return result[0], result[1]
     assert isinstance(sched_meta, FlashMLASchedMeta), "tile_scheduler_metadata must be of type FlashMLASchedMeta"
     assert num_splits is None, "num_splits must be None"
 
@@ -336,33 +288,25 @@ def flash_mla_sparse_fwd(
     return results
 
 
-def flash_mla_sparse_fp8_fwd(
+def flash_mla_sparse_quantized_fwd(
     q: torch.Tensor,
     kv: torch.Tensor,
     indices: torch.Tensor,
     sm_scale: float,
-    q_scale: float = 1.0,
-    kv_scale: float = 1.0,
+    quantization: Optional[QuantizedAttentionConfig] = None,
     d_v: int = 512,
     attn_sink: Optional[torch.Tensor] = None,
     topk_length: Optional[torch.Tensor] = None,
     out: Optional[torch.Tensor] = None,
     compute_aux: bool = True,
     trusted_full_topk: bool = False,
-    out_rope_freqs_cis: Optional[torch.Tensor] = None,
-    out_rope_positions: Optional[torch.Tensor] = None,
-    out_fp8: Optional[torch.Tensor] = None,
-    out_scale: Optional[torch.Tensor] = None,
-    out_quant_heads_per_group: int = 0,
-    out_token_offset: int = 0,
-    out_static_scale: Optional[float] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    Native FP8 (q8 x kv8) sparse attention prefill kernel.
+    Sparse quantized attention prefill with backend selection in C++.
 
-    Distinct from ``flash_mla_sparse_fwd``: that kernel takes bf16 q/kv (its fp8-KV
-    option dequantises during the gather and still runs the bf16 MMA), whereas this
-    one keeps both operands in e4m3 and uses the FP8 tensor-core path end to end.
+    The current E4M3 backend uses native Q8/KV8/P8 matrix operations with FP32
+    accumulation. ``quantization`` describes storage, compute format and scales;
+    unsupported configurations are rejected in C++.
 
     Args:
         q: [s_q, h_q, d_qk], bfloat16, float8_e4m3fn, or uint8 E4M3 bytes.
@@ -381,9 +325,12 @@ def flash_mla_sparse_fp8_fwd(
             <= 2176. Invalid indices (< 0 or >= s_kv) are masked exactly, so the tensor
             may be padded with -1; there is no need to append zero KV rows.
         sm_scale: float, the softmax scale.
-        q_scale: float, per-tensor dequantisation scale for q.
-        kv_scale: float, per-tensor dequantisation scale for kv. Both scales are folded
-            into the softmax exponent and the epilogue, so dequantisation is free.
+        quantization: optional QuantizedAttentionConfig. Storage, compute format,
+            probability format and Q/KV scales are specified separately. The current
+            backend supports E4M3 computation with scalar q_scale/kv_scale fields
+            (default 1.0). Tensor scales and q_scale_block_shape/kv_scale_block_shape
+            reserve space for future backends; unsupported formats or scale layouts
+            raise an error before launch.
         d_v: The dimension of value vectors. Can only be 512.
         attn_sink: optional [h_q] float32 attention sink in natural-log space.
         topk_length: optional [s_q] int32 valid prefix length for each indices row.
@@ -391,7 +338,7 @@ def flash_mla_sparse_fp8_fwd(
             For BF16 KV, omitted lengths are derived from the last valid column,
             retaining valid entries after holes or an unpooled sparse tail.
         out: optional preallocated contiguous [s_q, h_q, 512] bfloat16 output,
-            with a 16-byte-aligned base address. Must be None when out_fp8 is supplied.
+            with a 16-byte-aligned base address.
         compute_aux: whether to materialize max_logits and lse. Set False when the
             caller only consumes output; returned aux tensors then have shape [0].
         trusted_full_topk: certifies that every index before ``topk_length`` is in
@@ -400,64 +347,51 @@ def flash_mla_sparse_fp8_fwd(
             is slot-masked. The default is False and preserves support for arbitrary
             invalid indices anywhere in the active prefix, including length-full
             rows.
-        Fused inverse-RoPE/FP8 output writes directly to out_fp8 and out_scale.
-            It requires contiguous Q, h_q divisible by 64, topk <= 2048,
-            a 2-byte-aligned out_fp8 base address, out=None, and compute_aux=False.
-            Callers must consume these supplied buffers; all three returned
-            tensors are empty sentinels with shape [0].
 
     Returns:
         (output, max_logits, lse)
-        - output: [s_q, h_q, d_v], bfloat16; shape [0] in fused output mode.
+        - output: [s_q, h_q, d_v], bfloat16.
         - max_logits: [s_q, h_q], float. The ceil-quantised running max used internally,
             i.e. an upper bound on the true max rather than the max itself.
             Shape [0] when compute_aux=False.
         - lse: [s_q, h_q], float, base-2 log-sum-exp of quantized QK scores,
             computed in FP32 before attention-sink scaling. Shape [0] when compute_aux=False.
     """
-    return flash_mla_cuda.sparse_prefill_fp8_fwd(
+    return flash_mla_cuda.sparse_quantized_fwd(
         q,
         kv,
         indices,
         sm_scale,
-        q_scale,
-        kv_scale,
+        quantization,
         d_v,
         attn_sink,
         topk_length,
         out,
         compute_aux,
         trusted_full_topk,
-        out_rope_freqs_cis,
-        out_rope_positions,
-        out_fp8,
-        out_scale,
-        out_quant_heads_per_group,
-        out_token_offset,
-        0.0 if out_static_scale is None else float(out_static_scale),
     )
 
 
-def flash_mla_sparse_decode_fp8_fwd(
+def flash_mla_sparse_quantized_decode_fwd(
     q: torch.Tensor,
     kv: torch.Tensor,
     indices: torch.Tensor,
     sm_scale: float,
-    q_scale: float = 1.0,
-    kv_scale: float = 1.0,
+    quantization: Optional[QuantizedAttentionConfig] = None,
     d_v: int = 512,
     attn_sink: Optional[torch.Tensor] = None,
     topk_length: Optional[torch.Tensor] = None,
     out: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Native FP8 (q8 x kv8) sparse attention decode with automatic kernel selection.
+    """Sparse quantized attention decode with backend selection in C++.
 
-    Same math as ``flash_mla_sparse_fp8_fwd``. FlashMLA selects head tiles,
+    Same math as ``flash_mla_sparse_quantized_fwd``. FlashMLA selects head tiles,
     aligned key splits and pipeline stages from the input shape and device.
     Unsplit queries write final output directly; split queries merge their
     partial outputs internally. Q, K, P and V use native E4M3 tensor operations.
 
     Args:
+        quantization: optional QuantizedAttentionConfig, as in prefill.
         q: [n_tok, h_q, d_qk] BF16, float8_e4m3fn or uint8 E4M3 bytes.
             h_q is a positive multiple of 8; d_qk is 512 or 576.
             For decode n_tok is the batch size and the
@@ -480,13 +414,12 @@ def flash_mla_sparse_decode_fp8_fwd(
         - output: [n_tok, h_q, d_v] bfloat16.
         - lse: [n_tok, h_q] float32, 2-based, and -inf when a row has no valid index.
     """
-    return flash_mla_cuda.sparse_decode_fp8_fwd(
+    return flash_mla_cuda.sparse_quantized_decode_fwd(
         q,
         kv,
         indices,
         sm_scale,
-        q_scale,
-        kv_scale,
+        quantization,
         d_v,
         attn_sink,
         topk_length,

@@ -99,7 +99,7 @@ void prepare_sparse_prefill_index_bounds(
 }
 
 
-static constexpr int BN = 64, DV = 512, NK_PV = BN / 32;
+static constexpr int BN = 64, DV = 512;
 static constexpr float NEG_INF = -1e30f;
 static constexpr float P_SCALE = 448.f;
 static constexpr float LOG2_P_SCALE = 8.807354922f;
@@ -109,7 +109,11 @@ template <int BlockM> struct Fp8SparsePrefillTraits {
     static_assert(BlockM == 16 || BlockM == 32 || BlockM == 64, "unsupported head tile");
     static constexpr bool Compact = BlockM < 64;
     static constexpr int Threads = Compact ? 256 : 512;
-    static constexpr int QKThreads = (BlockM / 16) * 4 * 32;
+    static constexpr int QKWarpN = 4;
+    static constexpr int QKThreads = (BlockM / 16) * QKWarpN * 32;
+    CUTE_HOST_DEVICE static constexpr int score_row_offset(int e) {
+        return ((e >> 1) & 1) * 8;
+    }
     static constexpr int MaxTopk = 2176;
     using MmaQK = TiledMMA<MMA_Atom<PPU0015_16x16x32_F32E4M3E4M3F32_TN>,
         Layout<Shape<Int<BlockM / 16>, _4, _1>>, Tile<Int<BlockM>, Int<BN>, _32>>;
@@ -124,17 +128,14 @@ template <int BlockM> struct Fp8SparsePrefillTraits {
     }
 };
 
-#define SROW(e) (((((e) >> 1) & 1) * 8))
-
 template <int BM, int DQK, bool Q_IS_BF16, bool TRUSTED_FULL_TOPK, bool TWO_GROUP_ORDER,
-    bool CHECK_Q_BOUNDS, bool STATIC_OUT_SCALE>
+    bool CHECK_Q_BOUNDS>
 __global__ __launch_bounds__(Fp8SparsePrefillTraits<BM>::Threads,
     2) void flash_fwd_sparse_prefill_fp8_kernel(const void *__restrict__ gQRaw,
-    const E4M3 *__restrict__ gKV, const int *__restrict__ gIdx, float *__restrict__ gO,
-    float qk_scale_log2, int n_tiles, int s_kv, float out_scale, int h_q, int q_stride_t_or_groups,
+    const E4M3 *__restrict__ gKV, const int *__restrict__ gIdx, cutlass::bfloat16_t *__restrict__ gO,
+    float qk_scale_log2, int n_tiles, int s_kv, float out_scale, int h_q, int q_stride_t,
     int s_q, float *__restrict__ gMaxLogits, float *__restrict__ gLse,
-    const float *__restrict__ gAttnSink, const int *__restrict__ gTopkLength,
-    const void *__restrict__ gOutRopePositions, int out_meta_or_q_stride_h) {
+    const float *__restrict__ gAttnSink, const int *__restrict__ gTopkLength, int q_stride_h) {
     using Traits = Fp8SparsePrefillTraits<BM>;
     constexpr bool COMPACT = Traits::Compact;
     constexpr int NTHR = Traits::Threads, QK_THREADS = Traits::QKThreads;
@@ -143,10 +144,6 @@ __global__ __launch_bounds__(Fp8SparsePrefillTraits<BM>::Threads,
     using LayoutP8 = typename Traits::LayoutP;
     using CopyA8 = typename Traits::CopyA;
     using CopyB8 = typename Traits::CopyB;
-    const bool fused_epilogue = !COMPACT && gOutRopePositions != nullptr;
-    const int q_stride_t = fused_epilogue ? h_q * DQK : q_stride_t_or_groups;
-    const int q_stride_h = fused_epilogue ? DQK : out_meta_or_q_stride_h;
-    const int out_meta = fused_epilogue ? out_meta_or_q_stride_h : 0;
     static_assert(DQK == 512 || DQK == 576, "supported q8 sparse head dims are 512 and 576");
     static constexpr int NK_QK = DQK / 32;
     static constexpr int QTILE = BM * DQK, KTILE = BN * DQK;
@@ -186,27 +183,11 @@ __global__ __launch_bounds__(Fp8SparsePrefillTraits<BM>::Threads,
                                       (long)q_token * q_stride_t +
                                       (long)head_group * BM * q_stride_h;
     gIdx += (long)q_token * n_tiles * BN;
-    // Reuse otherwise-idle outputs to keep the fused ABI within 128 SRegs:
-    // gO=fp8, gMaxLogits=scale, gLse=RoPE freqs. out_meta packs T and dtype.
-    // BF16-output tiles reuse the two otherwise-unused scalar ABI fields
-    // for Q strides; fused-output tiles retain the contiguous-Q contract.
-    E4M3 *const gOutFp8 = fused_epilogue ? reinterpret_cast<E4M3 *>(gO) : nullptr;
-    float *const gOutScale = fused_epilogue ? gMaxLogits : nullptr;
-    const float *const gOutRopeFreqs = fused_epilogue ? gLse : nullptr;
-    const bool out_positions_i32 = (unsigned)out_meta >> 31;
-    const int out_total_tokens = out_meta & 0x7fffffff;
-    // gO is declared float* but the epilogue stores bf16, so the per-CTA advance
-    // must be in bf16 elements. Advancing the float* strode 2x too far, which put
-    // every CTA except 0 at the wrong output offset and wrote out of bounds past
-    // SQ/2. Dates from the fp32 -> bf16 epilogue change.
-    if (!fused_epilogue) {
-        gO = reinterpret_cast<float *>(reinterpret_cast<cutlass::bfloat16_t *>(gO) +
-                                       ((long)q_token * h_q + head_group * BM) * DV);
-        if (gMaxLogits)
-            gMaxLogits += (long)q_token * h_q + head_group * BM;
-        if (gLse)
-            gLse += (long)q_token * h_q + head_group * BM;
-    }
+    gO += ((long)q_token * h_q + head_group * BM) * DV;
+    if (gMaxLogits)
+        gMaxLogits += (long)q_token * h_q + head_group * BM;
+    if (gLse)
+        gLse += (long)q_token * h_q + head_group * BM;
     if (gAttnSink)
         gAttnSink += head_group * BM;
     int topk_length = gTopkLength ? gTopkLength[q_token] : n_tiles * BN;
@@ -373,16 +354,10 @@ __global__ __launch_bounds__(Fp8SparsePrefillTraits<BM>::Threads,
     const int vcol = wp * 16 + (lane >> 4) * 4;
     const int voff = (int)(reinterpret_cast<const uint8_t *>(&sKt0(vrow, vcol)) -
                            reinterpret_cast<const uint8_t *>(pK));
-    issue_K(0);
-    cute::cp_async_fence();
-    cute::cp_async_wait<0>();
-    __syncthreads();
+    flashmla_fp8_std::prime_kv_pipeline(issue_K);
 
     for (int t = 0; t < active_tiles; ++t) {
-        if (t + 1 < active_tiles) {
-            issue_K(t + 1);
-            cute::cp_async_fence();
-        }
+        flashmla_fp8_std::prefetch_next_kv(issue_K, t, active_tiles);
 
         Tensor acc_s = tqk.partition_fragment_C(sPt);
         Tensor acc_s1 = tqk.partition_fragment_C(sPt);
@@ -439,120 +414,36 @@ __global__ __launch_bounds__(Fp8SparsePrefillTraits<BM>::Threads,
             if (tid == 0)
                 *sFlag = 0;
 
-            float mx[2] = {NEG_INF, NEG_INF};
-            CUTE_UNROLL
-            for (int e = 0; e < 8; ++e) {
-                int s = SROW(e) ? 1 : 0;
-                mx[s] = fmaxf(mx[s], acc_s(e)); // raw; scaled once in the combine
-            }
-#pragma unroll
-            for (int s = 0; s < 2; ++s) {
-                mx[s] = fmaxf(mx[s], __shfl_xor_sync(0xffffffff, mx[s], 1));
-                mx[s] = fmaxf(mx[s], __shfl_xor_sync(0xffffffff, mx[s], 2));
-            }
-            if ((lane & 3) == 0) {
-                sPmax[wn * BM + r0] = mx[0];
-                sPmax[wn * BM + r1] = mx[1];
-            }
+            flashmla_fp8_std::reduce_score_max<Traits, BM, 8>(acc_s, sPmax, lane, wn, r0, r1);
         } // All participating QK warps reconverge before the block barrier.
         __syncthreads();
         if (tid < BM) {
-            float m = fmaxf(fmaxf(sPmax[0 * BM + tid], sPmax[1 * BM + tid]),
-                          fmaxf(sPmax[2 * BM + tid], sPmax[3 * BM + tid])) *
-                      qk_scale_log2;
-            float mprev = sRunMax[tid];
-            // Quantise the running max to whole exp2 steps: the correction factor
-            // becomes an exact power of two and, more importantly, stays at 1 for
-            // most tiles, so the 64-multiply acc_o rescale is skipped.
-            float mnew = fmaxf(mprev, ceilf(m));
-            sRunMax[tid] = mnew;
-            float sc = (mprev == NEG_INF) ? 1.f : exp2f(mprev - mnew);
-            sScale[tid] = sc;
-            if (sc != 1.f)
-                *sFlag = 1;
+            flashmla_fp8_std::update_running_max<Traits, BM>(sPmax, sRunMax, sScale, sFlag, tid, qk_scale_log2);
         }
         __syncthreads();
 
         if (tid < QK_THREADS) {
             const float mx0 = sRunMax[r0], mx1 = sRunMax[r1];
-            float sm[2] = {0.f, 0.f};
-            Tensor cP = tqk.partition_C(sPt);
-            // cP(e) and cP(e+1) are n and n+1 of the same row, hence physically
-            // adjacent inside one 16-byte swizzle granule: pack them into one 2-byte
-            // store to halve the store count and the store bank conflicts.
-            CUTE_UNROLL
-            for (int e = 0; e < 8; e += 2) {
-
-                int s = SROW(e) ? 1 : 0;
-                float mxs = s ? mx1 : mx0;
-                const float bias = LOG2_P_SCALE - mxs;
-                float v0 = exp2f(fmaf(acc_s(e), qk_scale_log2, bias));
-                float v1 = exp2f(fmaf(acc_s(e + 1), qk_scale_log2, bias));
-                sm[s] += v0 + v1; // sums already carry P_SCALE
-                const __hg_fp8x2_storage_t packed =
-                    flashmla::sparse_native_fp8::pack_e4m3_pair(make_float2(v0, v1));
-                *reinterpret_cast<__hg_fp8x2_storage_t *>(&cP(e)) = packed;
-            }
-#pragma unroll
-            for (int s = 0; s < 2; ++s) {
-                sm[s] += __shfl_xor_sync(0xffffffff, sm[s], 1);
-                sm[s] += __shfl_xor_sync(0xffffffff, sm[s], 2);
-            }
-            if ((lane & 3) == 0) {
-                sPsum[wn * BM + r0] = sm[0];
-                sPsum[wn * BM + r1] = sm[1];
-            }
+            flashmla_fp8_std::quantize_probability<Traits, BM, 8>(
+                acc_s, tqk, sPt, sPsum, lane, wn, r0, r1, mx0, mx1, qk_scale_log2);
         }
 
         if (*sFlag) {
-            float os[BM / 8];
-#pragma unroll
-            for (int j = 0; j < BM / 8; ++j)
-                os[j] = sScale[j * 8 + mi];
-            CUTE_UNROLL
-            for (int e = 0; e < size(acc_o); ++e)
-                acc_o(e) *= os[Traits::output_row(e) >> 3];
+            flashmla_fp8_std::rescale_output<Traits, BM>(acc_o, sScale, mi);
         }
         __syncthreads();
 
         if (tid < BM) {
-            float tile_sum = sPsum[0 * BM + tid] + sPsum[1 * BM + tid] + sPsum[2 * BM + tid] +
-                             sPsum[3 * BM + tid];
-            sRunSum[tid] = sRunSum[tid] * sScale[tid] + tile_sum;
+            flashmla_fp8_std::update_running_sum<Traits, BM, false>(sPsum, sRunSum, sScale, tid);
         }
 
         // Accumulate PV directly in the running output fragment.
         // Fragment storage follows the logical PV operand shape. Actual loads
         // transpose four-byte pieces from the swizzled KV stage into that shape.
-        Tensor rV = tpv.partition_fragment_B(
-            make_tensor(make_smem_ptr(pK), Layout<Shape<Int<DV>, Int<BN>>, Stride<_1, Int<DV>>>{}));
-        CUTE_UNROLL
-        for (int k = 0; k < NK_PV; ++k) {
-            CUTE_UNROLL
-            for (int n = 0; n < DV / (NTHR / 2); ++n) {
-                const int ub = UNIF((t & 1) * KTILE + n * (NTHR / 2 * BN) + k * (4 * 512));
-                const auto *vb = reinterpret_cast<const uint8_t *>(pK) + ub;
-                uint32_t a = *(const uint32_t *)(vb + voff);
-                uint32_t b = *(const uint32_t *)(vb + voff + 1024);
-                uint32_t c = *(const uint32_t *)(vb + voff + 8);
-                uint32_t d = *(const uint32_t *)(vb + voff + 1032);
-                auto *rv = (uint32_t *)&rV(0, n, k);
-                rv[0] = ppu_mat_trans_b8(a);
-                rv[1] = ppu_mat_trans_b8(b);
-                rv[2] = ppu_mat_trans_b8(c);
-                rv[3] = ppu_mat_trans_b8(d);
-            }
-            CUTE_UNROLL
-            for (int m2 = 0; m2 < BM / 16; ++m2)
-                PPU_LDM((uint32_t *)&rP(0, m2, k), ptsm0 + m2 * 64 + k * 2, qk_lbo_a, qk_sbo_a);
-            __ppu_sched_bound();
-            cute::gemm(mpv, rP(_, _, k), rV(_, _, k), acc_o);
-        }
+        flashmla_fp8_std::accumulate_pv<Traits, BM, BN>(
+            tpv, rP, mpv, acc_o, pK, ptsm0, voff, (t & 1) * KTILE);
 
-        if (t + 1 < active_tiles) {
-            cute::cp_async_wait<0>(); // Next KV stage has landed.
-            __syncthreads();          // Current PV readers have released the other stage.
-        }
+        flashmla_fp8_std::wait_next_kv(t, active_tiles);
     }
     // Publish the final running sum before any PV warp consumes it.
     __syncthreads();
@@ -571,7 +462,7 @@ __global__ __launch_bounds__(Fp8SparsePrefillTraits<BM>::Threads,
 
     // Optional statistics follow the FP8 interface: a ceil-quantized maximum
     // and base-2 LSE of the quantized QK scores, before attention-sink scaling.
-    if (!fused_epilogue && tid < active_heads && (gMaxLogits || gLse)) {
+    if (tid < active_heads && (gMaxLogits || gLse)) {
         const float m = sRunMax[tid], s = sRunSum[tid];
         if (gMaxLogits)
             gMaxLogits[tid] = m;
@@ -580,128 +471,24 @@ __global__ __launch_bounds__(Fp8SparsePrefillTraits<BM>::Threads,
     }
     // bf16 output, matching the production kernel: fp32 would double the store
     // traffic and thrash L2 against the KV cache at realistic grid sizes.
-    Tensor gObf = make_tensor(make_gmem_ptr(reinterpret_cast<cutlass::bfloat16_t *>(gO)),
-        Shape<Int<BM>, Int<DV>>{}, GenRowMajor{});
+    Tensor gObf = make_tensor(make_gmem_ptr(gO), Shape<Int<BM>, Int<DV>>{}, GenRowMajor{});
     Tensor cO = tpv.partition_C(gObf);
-    if (fused_epilogue) {
-        // Direct Q8 epilogue: normalize the FP32 attention accumulators, round to
-        if constexpr (DQK == 512) {
-            Tensor idO = make_identity_tensor(Shape<Int<BM>, Int<DV>>{});
-            Tensor cOid = tpv.partition_C(idO);
-
-            // the same BF16 values consumed by the legacy epilogue, apply inverse RoPE,
-            // and quantize each 8-head output-projection group without a BF16 gmem
-            // materialization. sPmax is dead after the tile loop and is reused as
-            // [8 groups, 16 warps] reduction scratch.
-            const int tok = q_token;
-            int pos = 0;
-            if (lane == 0) {
-                pos = out_positions_i32
-                          ? __ldg(reinterpret_cast<const int32_t *>(gOutRopePositions) + tok)
-                          : (int)__ldg(reinterpret_cast<const int64_t *>(gOutRopePositions) + tok);
-            }
-            pos = __shfl_sync(0xffffffff, pos, 0);
-            static constexpr int OUT_ROPE_DIM = 64;
-            static constexpr int rope_begin = DV - OUT_ROPE_DIM;
-
-// Process one output-projection group at a time. This needs one running
-// maximum rather than eight long-lived values. Each warp emits one partial
-// per group, avoiding atomics entirely.
-#pragma unroll
-            for (int og = 0; og < BM / 8; ++og) {
-                float local_max = 0.f;
-                CUTE_UNROLL
-                for (int e = 0; e < size(acc_o); e += 2) {
-                    if ((Traits::output_row(e) >> 3) == og) {
-                        const float sc = rs[og];
-                        float x0 = (float)cutlass::bfloat16_t(acc_o(e) * sc);
-                        float x1 = (float)cutlass::bfloat16_t(acc_o(e + 1) * sc);
-                        const int d0 = get<1>(cOid(e));
-                        if (d0 >= rope_begin) {
-                            const float *fc =
-                                gOutRopeFreqs + (long)pos * OUT_ROPE_DIM + (d0 - rope_begin);
-                            const float fr = fc[0], fi = fc[1];
-                            const float y0 = x0 * fr + x1 * fi;
-                            const float y1 = x1 * fr - x0 * fi;
-                            x0 = (float)cutlass::bfloat16_t(y0);
-                            x1 = (float)cutlass::bfloat16_t(y1);
-                        }
-                        acc_o(e) = x0;
-                        acc_o(e + 1) = x1;
-                        if constexpr (!STATIC_OUT_SCALE) {
-                            local_max = fmaxf(local_max, fmaxf(fabsf(x0), fabsf(x1)));
-                        }
-                    }
-                }
-                if constexpr (!STATIC_OUT_SCALE) {
-                    // local_max is finite and nonnegative, so signed integer bit order
-                    // is identical to float order and preserves the exact maximum.
-                    local_max =
-                        __int_as_float(__reduce_max_sync(0xffffffff, __float_as_int(local_max)));
-                    if (lane == 0)
-                        sPmax[og * (NTHR / 32) + wp] = local_max;
-                }
-            }
-            float group_max = 0.f;
-            float group_inv = 16.f;
-            if constexpr (!STATIC_OUT_SCALE) {
-                __syncthreads();
-                if (lane < BM / 8) {
-#pragma unroll
-                    for (int w = 0; w < NTHR / 32; ++w)
-                        group_max = fmaxf(group_max, sPmax[lane * (NTHR / 32) + w]);
-                }
-                group_inv = lane < BM / 8 && group_max > 0.f ? P_SCALE / group_max : 0.f;
-            }
-
-            // Eight lanes own the eight group reciprocals. This turns the old
-            // per-thread, per-pair divides into eight divides per warp; the flat
-            // fragment walk then broadcasts the already-computed reciprocal.
-            const long out_base =
-                ((long)(head_group * (BM / 8)) * out_total_tokens + tok) * (8 * DV) + (long)mi * DV;
-            const long out_group_stride = (long)out_total_tokens * (8 * DV);
-            CUTE_UNROLL
-            for (int e = 0; e < size(acc_o); e += 2) {
-                const int og = Traits::output_row(e) >> 3;
-                const float inv = STATIC_OUT_SCALE ? 16.f : __shfl_sync(0xffffffff, group_inv, og);
-                const int d0 = get<1>(cOid(e));
-                const long off = out_base + (long)og * out_group_stride + d0;
-                const __hg_fp8x2_storage_t packed = flashmla::sparse_native_fp8::pack_e4m3_pair(
-                    make_float2(acc_o(e) * inv, acc_o(e + 1) * inv));
-                *reinterpret_cast<__hg_fp8x2_storage_t *>(gOutFp8 + off) = packed;
-            }
-            if (wp == 0 && lane < BM / 8) {
-                const int out_group = head_group * (BM / 8) + lane;
-                if constexpr (STATIC_OUT_SCALE) {
-                    gOutScale[(long)out_group * out_total_tokens + tok] = 1.f / 16.f;
-                } else {
-                    const float m = group_max;
-                    gOutScale[(long)out_group * out_total_tokens + tok] =
-                        m > 0.f ? m / P_SCALE : 1.f;
-                }
-            }
-        }
-    } else {
-        // Pack adjacent BF16 elements into a single global store.
-        CUTE_UNROLL
-        for (int e = 0; e < size(acc_o); e += 2) {
-
-            if (Traits::output_row(e) + mi >= active_heads)
-                continue;
-            const float sc = rs[Traits::output_row(e) >> 3];
-            const cutlass::bfloat16_t b0(acc_o(e) * sc), b1(acc_o(e + 1) * sc);
-            const uint32_t packed = (uint32_t)reinterpret_cast<const uint16_t &>(b0) |
-                                    ((uint32_t)reinterpret_cast<const uint16_t &>(b1) << 16);
-            *reinterpret_cast<uint32_t *>(&cO(e)) = packed;
-        }
+    // Pack adjacent BF16 elements into a single global store.
+    CUTE_UNROLL
+    for (int e = 0; e < size(acc_o); e += 2) {
+        if (Traits::output_row(e) + mi >= active_heads)
+            continue;
+        const float sc = rs[Traits::output_row(e) >> 3];
+        const cutlass::bfloat16_t b0(acc_o(e) * sc), b1(acc_o(e + 1) * sc);
+        const uint32_t packed = (uint32_t)reinterpret_cast<const uint16_t &>(b0) |
+                                ((uint32_t)reinterpret_cast<const uint16_t &>(b1) << 16);
+        *reinterpret_cast<uint32_t *>(&cO(e)) = packed;
     }
 }
 
 // ---------------------------------------------------------------------------
-bool try_sparse_fp8_std(const void *, const void *, const int *, void *, float *,
-    float *, const float *, const int *, float, float, int, int, int, int, int, bool, hggcStream_t, int = 0);
-bool try_sparse_prefill_fp8_ws(const void *, const void *, const int *, void *, float *,
-    float *, const float *, const int *, float, float, int, int, int, int, int, hggcStream_t);
+bool try_sparse_fp8_std(const flashmla::sparse_native_fp8::AttentionParams &params);
+bool try_sparse_prefill_fp8_ws(const flashmla::sparse_native_fp8::AttentionParams &params);
 // Host launcher: head count, Q layout and sparse width select a tile.
 // Both variants share the same public binding, stream and output contract.
 // ---------------------------------------------------------------------------
@@ -710,126 +497,77 @@ template <int BM, int DQK> static constexpr int fp8_sparse_prefill_smem() {
     return BM * DQK + (2 * BN * DQK) + BM * BN + Traits::MaxTopk * 4 + 11 * BM * 4 + 256;
 }
 
-template <int BM, int DQK, bool Q_IS_BF16, bool TRUSTED_FULL_TOPK, bool STATIC_OUT_SCALE>
-void launch_sparse_prefill_fp8_fwd(const void *q, const void *kv, const int *indices, void *out,
-    float *max_logits, float *lse, const float *attn_sink, const int *topk_length,
-    float qk_scale_log2, float out_scale, int s_q, int n_tiles, int s_kv, int h_q,
-    hggcStream_t stream, const float *out_rope_freqs, const void *out_rope_positions, E4M3 *out_fp8,
-    float *out_fp8_scale, int out_rope_dim, bool out_positions_i32, int out_total_tokens,
-    int out_token_offset, int q_stride_t, int q_stride_h) {
+template <int BM, int DQK, bool Q_IS_BF16, bool TRUSTED_FULL_TOPK>
+void launch_sparse_prefill_fp8_fwd(const flashmla::sparse_native_fp8::AttentionParams &params) {
     constexpr int NTHR = Fp8SparsePrefillTraits<BM>::Threads;
     constexpr int smem = fp8_sparse_prefill_smem<BM, DQK>();
-    const int n_head_groups = (h_q + BM - 1) / BM;
-    const bool fused_epilogue = out_fp8 != nullptr;
-    // Offset only the token dimension; the group stride remains the full T.
-    E4M3 *const out_fp8_base = fused_epilogue ? out_fp8 + (long)out_token_offset * 8 * DV : nullptr;
-    float *const out_scale_base = fused_epilogue ? out_fp8_scale + out_token_offset : nullptr;
-    const void *out_positions_base = nullptr;
-    if (fused_epilogue) {
-        out_positions_base =
-            out_positions_i32
-                ? static_cast<const void *>(
-                      reinterpret_cast<const int32_t *>(out_rope_positions) + out_token_offset)
-                : static_cast<const void *>(
-                      reinterpret_cast<const int64_t *>(out_rope_positions) + out_token_offset);
-    }
-    void *const kernel_out = fused_epilogue ? static_cast<void *>(out_fp8_base) : out;
-    float *const kernel_max = fused_epilogue ? out_scale_base : max_logits;
-    float *const kernel_lse = fused_epilogue ? const_cast<float *>(out_rope_freqs) : lse;
-    const int out_meta =
-        (out_total_tokens & 0x7fffffff) | (out_positions_i32 ? (int)0x80000000u : 0);
-#define LAUNCH_ORDER(TWO_GROUPS, CHECK_BOUNDS, GRID)                                               \
-    do {                                                                                           \
-        hggcFuncSetAttribute(flash_fwd_sparse_prefill_fp8_kernel<BM, DQK, Q_IS_BF16,               \
-                                 TRUSTED_FULL_TOPK, TWO_GROUPS, CHECK_BOUNDS, STATIC_OUT_SCALE>,   \
-            hggcFuncAttributeMaxDynamicSharedMemorySize, smem);                                    \
-        flash_fwd_sparse_prefill_fp8_kernel<BM, DQK, Q_IS_BF16, TRUSTED_FULL_TOPK, TWO_GROUPS,     \
-            CHECK_BOUNDS, STATIC_OUT_SCALE><<<GRID, NTHR, smem, stream>>>(q,                       \
-            reinterpret_cast<const E4M3 *>(kv), indices, reinterpret_cast<float *>(kernel_out),    \
-            qk_scale_log2, n_tiles, s_kv, out_scale, h_q,                                          \
-            fused_epilogue ? n_head_groups : q_stride_t, s_q, kernel_max, kernel_lse, attn_sink,   \
-            topk_length, out_positions_base, fused_epilogue ? out_meta : q_stride_h);              \
+    const int n_head_groups = (params.heads + BM - 1) / BM;
+#define LAUNCH_ORDER(TWO_GROUPS, CHECK_BOUNDS, GRID)                                            \
+    do {                                                                                        \
+        hggcFuncSetAttribute(                                                                   \
+            flash_fwd_sparse_prefill_fp8_kernel<BM, DQK, Q_IS_BF16, TRUSTED_FULL_TOPK,          \
+                                                TWO_GROUPS, CHECK_BOUNDS>,                      \
+            hggcFuncAttributeMaxDynamicSharedMemorySize, smem);                                 \
+        flash_fwd_sparse_prefill_fp8_kernel<BM, DQK, Q_IS_BF16, TRUSTED_FULL_TOPK,              \
+                                            TWO_GROUPS, CHECK_BOUNDS>                           \
+            <<<GRID, NTHR, smem, params.stream>>>(                                              \
+                params.q, reinterpret_cast<const E4M3 *>(params.kv), params.idx,                \
+                reinterpret_cast<cutlass::bfloat16_t *>(params.out), params.scale,              \
+                params.width / BN, params.kvrows, params.os, params.heads, params.qst,          \
+                params.queries, params.maxima, params.lse, params.sink, params.lengths,         \
+                params.qsh);                                                                    \
     } while (0)
     if (n_head_groups == 2) {
-        const dim3 grid(4, (s_q + 1) / 2);
-        if (s_q & 1)
+        const dim3 grid(4, (params.queries + 1) / 2);
+        if (params.queries & 1)
             LAUNCH_ORDER(true, true, grid);
         else
             LAUNCH_ORDER(true, false, grid);
     } else {
         // Preserve the original H64 grid shape and blockIdx mapping exactly.
-        const dim3 grid(s_q, n_head_groups);
+        const dim3 grid(params.queries, n_head_groups);
         LAUNCH_ORDER(false, false, grid);
     }
 #undef LAUNCH_ORDER
 }
 
 template <int BM>
-static void dispatch_sparse_prefill_fp8_fwd(const void *q, const void *kv, const int *indices,
-    void *out, float *max_logits, float *lse, const float *attn_sink, const int *topk_length,
-    float qk_scale_log2, float out_scale, int d_qk, int s_q, int n_tiles, int s_kv, int h_q,
-    bool q_is_bf16, bool trusted_full_topk, hggcStream_t stream, const float *out_rope_freqs,
-    const void *out_rope_positions, void *out_fp8, float *out_fp8_scale, int out_rope_dim,
-    bool out_positions_i32, int out_total_tokens, int out_token_offset, bool static_out_scale,
-    int q_stride_t, int q_stride_h) {
-#define LAUNCH(D, QBF16, STATIC_SCALE)                                                             \
-    do {                                                                                           \
-        if (trusted_full_topk)                                                                     \
-            launch_sparse_prefill_fp8_fwd<BM, D, QBF16, true, STATIC_SCALE>(q, kv, indices, out,   \
-                max_logits, lse, attn_sink, topk_length, qk_scale_log2, out_scale, s_q, n_tiles,   \
-                s_kv, h_q, stream, out_rope_freqs, out_rope_positions,                             \
-                reinterpret_cast<E4M3 *>(out_fp8), out_fp8_scale, out_rope_dim, out_positions_i32, \
-                out_total_tokens, out_token_offset, q_stride_t, q_stride_h);                       \
-        else                                                                                       \
-            launch_sparse_prefill_fp8_fwd<BM, D, QBF16, false, STATIC_SCALE>(q, kv, indices, out,  \
-                max_logits, lse, attn_sink, topk_length, qk_scale_log2, out_scale, s_q, n_tiles,   \
-                s_kv, h_q, stream, out_rope_freqs, out_rope_positions,                             \
-                reinterpret_cast<E4M3 *>(out_fp8), out_fp8_scale, out_rope_dim, out_positions_i32, \
-                out_total_tokens, out_token_offset, q_stride_t, q_stride_h);                       \
+static void
+dispatch_sparse_prefill_fp8_fwd(const flashmla::sparse_native_fp8::AttentionParams &params) {
+#define LAUNCH(D, QBF16)                                                                        \
+    do {                                                                                        \
+        if (params.trusted_full_topk)                                                           \
+            launch_sparse_prefill_fp8_fwd<BM, D, QBF16, true>(params);                          \
+        else                                                                                    \
+            launch_sparse_prefill_fp8_fwd<BM, D, QBF16, false>(params);                         \
     } while (0)
-    if (d_qk == 512 && q_is_bf16) {
-        if (static_out_scale)
-            LAUNCH(512, true, true);
-        else
-            LAUNCH(512, true, false);
-    } else if (d_qk == 512) {
-        if (static_out_scale)
-            LAUNCH(512, false, true);
-        else
-            LAUNCH(512, false, false);
-    } else if (q_is_bf16) {
-        LAUNCH(576, true, false);
+    if (params.dim == 512 && params.qbf) {
+        LAUNCH(512, true);
+    } else if (params.dim == 512) {
+        LAUNCH(512, false);
+    } else if (params.qbf) {
+        LAUNCH(576, true);
     } else {
-        LAUNCH(576, false, false);
+        LAUNCH(576, false);
     }
 #undef LAUNCH
 }
 
-void run_sparse_prefill_fp8_fwd(const void *q, const void *kv, const int *indices, void *out,
-    float *max_logits, float *lse, const float *attn_sink, const int *topk_length,
-    float qk_scale_log2, float out_scale, int d_qk, int s_q, int n_tiles, int s_kv, int h_q,
-    bool q_is_bf16, bool trusted_full_topk, hggcStream_t stream, const float *out_rope_freqs,
-    const void *out_rope_positions, void *out_fp8, float *out_fp8_scale, int out_rope_dim,
-    bool out_positions_i32, int out_total_tokens, int out_token_offset, bool static_out_scale,
-    int q_stride_t, int q_stride_h) {
-    if (s_q == 0)
+void run_sparse_prefill_fp8_fwd(const flashmla::sparse_native_fp8::AttentionParams &params) {
+    if (params.queries == 0)
         return;
-    if (h_q % 64 == 0 && !q_is_bf16 && !out_fp8 && q_stride_t == h_q * d_qk && q_stride_h == d_qk &&
-        try_sparse_fp8_std(q, kv, indices, out, max_logits, lse, attn_sink,
-            topk_length, qk_scale_log2, out_scale, d_qk, s_q, n_tiles, s_kv, h_q, trusted_full_topk,
-            stream))
+    if (params.heads % 64 == 0 && !params.qbf &&
+        params.qst == params.heads * params.dim && params.qsh == params.dim &&
+        try_sparse_fp8_std(params))
         return;
-    if (h_q % 64 == 0 && !q_is_bf16 && !out_fp8 && q_stride_t == h_q * d_qk && q_stride_h == d_qk &&
-        try_sparse_prefill_fp8_ws(q, kv, indices, out, max_logits, lse, attn_sink, topk_length,
-            qk_scale_log2, out_scale, d_qk, s_q, n_tiles, s_kv, h_q, stream))
+    if (params.heads % 64 == 0 && !params.qbf &&
+        params.qst == params.heads * params.dim && params.qsh == params.dim &&
+        try_sparse_prefill_fp8_ws(params))
         return;
     // Complete 64-head groups reuse each gathered KV tile across
     // all heads, including sparse lists with a partially filled final tile.
-    auto dispatch = h_q <= 16   ? dispatch_sparse_prefill_fp8_fwd<16>
-                    : h_q <= 32 ? dispatch_sparse_prefill_fp8_fwd<32>
-                                : dispatch_sparse_prefill_fp8_fwd<64>;
-    dispatch(q, kv, indices, out, max_logits, lse, attn_sink, topk_length, qk_scale_log2, out_scale,
-        d_qk, s_q, n_tiles, s_kv, h_q, q_is_bf16, trusted_full_topk, stream, out_rope_freqs,
-        out_rope_positions, out_fp8, out_fp8_scale, out_rope_dim, out_positions_i32,
-        out_total_tokens, out_token_offset, static_out_scale, q_stride_t, q_stride_h);
+    auto dispatch = params.heads <= 16   ? dispatch_sparse_prefill_fp8_fwd<16>
+                    : params.heads <= 32 ? dispatch_sparse_prefill_fp8_fwd<32>
+                                         : dispatch_sparse_prefill_fp8_fwd<64>;
+    dispatch(params);
 }

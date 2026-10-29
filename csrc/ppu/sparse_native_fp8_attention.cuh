@@ -1,11 +1,86 @@
 #pragma once
 
+#include <hggc_runtime.h>
+
+namespace flashmla::sparse_native_fp8 {
+
+// One prepared request is passed through host routing to the final device launch.
+// Views for split output or folded queries copy this contract and override only
+// the affected fields; the original request remains available for merge/fallback.
+struct AttentionParams {
+    const void *q{};
+    const void *kv{};
+    const int *idx{};
+    const float *sink{};
+    const int *lengths{};
+    void *out{};
+    float *lse{};
+    float *maxima{};
+    float scale{}; // Q/K dequantization and softmax scale, in base 2.
+    float os{1.f}; // V dequantization scale.
+    int dim{}, queries{}, heads{}, width{}, kvrows{};
+    int qst{}, qsh{};
+    bool qbf{}, trusted_full_topk{};
+    hggcStream_t stream{};
+    int lse_queries{}; // Zero: flat base-2 LSE; positive: paged natural LSE.
+
+    const void *extra{};
+    const int *extra_idx{};
+    const int *extra_lengths{};
+    int extra_width{}, extra_rows{};
+
+    int splits{1};
+    void *part{};
+    float *plse{}, *partial_maxima{};
+    bool two_stage{}, cache_resident{};
+    int primary_width{}, primary_rows{}; // Original-pool bounds in a combined launch view.
+    int compute_units{}, cache_bytes{};
+
+    int batch{}, qpr{1}, padded_width{};
+    int *united{}, *errors{};
+    unsigned *masks{};
+    const float *fold_sink{};
+
+};
+
+struct MergeParams {
+    const void *part{};
+    const float *plse{};
+    void *out{};
+    float *lse{};
+    const float *sink{};
+    int tokens{};
+    int splits{};
+    int heads{};
+    hggcStream_t stream{};
+    int lse_queries{};
+    const float *partial_maxima{};
+    float *maxima{};
+    MergeParams() = default;
+    explicit MergeParams(const AttentionParams &p)
+        : part(p.part), plse(p.plse), out(p.out), lse(p.lse), sink(p.sink), tokens(p.queries),
+          splits(p.splits), heads(p.heads), stream(p.stream), lse_queries(p.lse_queries),
+          partial_maxima(p.partial_maxima), maxima(p.maxima) {}
+};
+
+} // namespace flashmla::sparse_native_fp8
+
+void run_sparse_prefill_fp8_fwd(const flashmla::sparse_native_fp8::AttentionParams &params);
+void run_native_fp8_attention_decode(const flashmla::sparse_native_fp8::AttentionParams &params);
+void run_native_fp8_attention_extra(const flashmla::sparse_native_fp8::AttentionParams &params);
+void run_native_fp8_attention_verify(const flashmla::sparse_native_fp8::AttentionParams &params);
+void run_native_fp8_attention_window(const flashmla::sparse_native_fp8::AttentionParams &params);
+void run_native_fp8_attention_merge(const flashmla::sparse_native_fp8::MergeParams &params);
+
+// Host C++ includes only launch contracts. Device implementation and the
+// actlize version override belong to HGGC translation units only.
+#ifdef __HGGCCC__
+
 // Shared native FP8 sparse attention for prefill, decode and verification:
 // E4M3 conversion, LSE storage, standard CTA kernels and WS pipeline components.
 
 #include "ppu/sparse_native_fp8_arch.h"
 #include "sparse_native_fp8_config.h"
-#include <hggc_runtime.h>
 #include <hgrt/hggc_extend_device_functions.h>
 #include <hggc_bf16.h>
 #include <hggc_fp8.h>
@@ -86,6 +161,154 @@ static constexpr float P_SCALE = 448.f;
 static constexpr float LOG2_P_SCALE = 8.807354922f;
 using AtomS8 = decltype(composition(Swizzle<2, 4, 3>{}, Layout<Shape<_8, _64>, Stride<_64, _1>>{}));
 
+// Shared arithmetic components for CTA attention. Callers retain their QK
+// participation scopes and barrier boundaries; these affect PPU code scheduling.
+// Q loading, gather, tile shape and epilogue remain compile-time kernel policies.
+template <class Traits, int BM, int ScoreValues, class Scores>
+__device__ __forceinline__ void reduce_score_max(
+    const Scores &acc_s, float *sPmax, int lane, int wn, int r0, int r1) {
+    float mx[2] = {NEG_INF, NEG_INF};
+    CUTE_UNROLL
+    for (int e = 0; e < ScoreValues; ++e) {
+        int s = Traits::score_row_offset(e) ? 1 : 0;
+        mx[s] = fmaxf(mx[s], acc_s(e)); // raw; scaled once in the combine
+    }
+#pragma unroll
+    for (int s = 0; s < 2; ++s) {
+        mx[s] = fmaxf(mx[s], __shfl_xor_sync(0xffffffff, mx[s], 1));
+        mx[s] = fmaxf(mx[s], __shfl_xor_sync(0xffffffff, mx[s], 2));
+    }
+    if ((lane & 3) == 0) {
+        sPmax[wn * BM + r0] = mx[0];
+        sPmax[wn * BM + r1] = mx[1];
+    }
+}
+
+template <class Traits, int BM>
+__device__ __forceinline__ void update_running_max(
+    float *sPmax, float *sRunMax, float *sScale, int *sFlag, int tid, float qk_scale_log2) {
+    float m = fmaxf(sPmax[tid], sPmax[BM + tid]);
+    if constexpr (Traits::QKWarpN == 4)
+        m = fmaxf(m, fmaxf(sPmax[2 * BM + tid], sPmax[3 * BM + tid]));
+    m *= qk_scale_log2;
+    float mprev = sRunMax[tid];
+    // Quantise the running max to whole exp2 steps: the correction factor
+    // becomes an exact power of two and, more importantly, stays at 1 for
+    // most tiles, so the 64-multiply acc_o rescale is skipped.
+    float mnew = fmaxf(mprev, ceilf(m));
+    sRunMax[tid] = mnew;
+    float sc = (mprev == NEG_INF) ? 1.f : exp2f(mprev - mnew);
+    sScale[tid] = sc;
+    if (sc != 1.f)
+        *sFlag = 1;
+}
+
+template <class Traits, int BM, int ScoreValues, class Scores, class QKSlice, class PMatrix>
+__device__ __forceinline__ void quantize_probability(Scores &acc_s, const QKSlice &tqk, PMatrix &sPt,
+    float *sPsum, int lane, int wn, int r0, int r1, float mx0, float mx1, float qk_scale_log2) {
+    float sm[2] = {0.f, 0.f};
+    Tensor cP = tqk.partition_C(sPt);
+    // cP(e) and cP(e+1) are n and n+1 of the same row, hence physically
+    // adjacent inside one 16-byte swizzle granule: pack them into one 2-byte
+    // store to halve the store count and the store bank conflicts.
+    CUTE_UNROLL
+    for (int e = 0; e < ScoreValues; e += 2) {
+        int s = Traits::score_row_offset(e) ? 1 : 0;
+        float mxs = s ? mx1 : mx0;
+        const float bias = LOG2_P_SCALE - mxs;
+        float v0 = exp2f(fmaf(acc_s(e), qk_scale_log2, bias));
+        float v1 = exp2f(fmaf(acc_s(e + 1), qk_scale_log2, bias));
+        sm[s] += v0 + v1; // sums already carry P_SCALE
+        const __hg_fp8x2_storage_t packed =
+            flashmla::sparse_native_fp8::pack_e4m3_pair(make_float2(v0, v1));
+        *reinterpret_cast<__hg_fp8x2_storage_t *>(&cP(e)) = packed;
+    }
+#pragma unroll
+    for (int s = 0; s < 2; ++s) {
+        sm[s] += __shfl_xor_sync(0xffffffff, sm[s], 1);
+        sm[s] += __shfl_xor_sync(0xffffffff, sm[s], 2);
+    }
+    if ((lane & 3) == 0) {
+        sPsum[wn * BM + r0] = sm[0];
+        sPsum[wn * BM + r1] = sm[1];
+    }
+}
+
+template <class Traits, int BM, class Output>
+__device__ __forceinline__ void rescale_output(Output &acc_o, const float *sScale, int mi) {
+    float os[BM / 8];
+#pragma unroll
+    for (int j = 0; j < BM / 8; ++j)
+        os[j] = sScale[j * 8 + mi];
+    CUTE_UNROLL
+    for (int e = 0; e < size(acc_o); ++e)
+        acc_o(e) *= os[Traits::output_row(e) >> 3];
+}
+
+template <class Traits, int BM, bool SingleTile>
+__device__ __forceinline__ void update_running_sum(
+    const float *sPsum, float *sRunSum, const float *sScale, int tid) {
+    float tile_sum = sPsum[tid] + sPsum[BM + tid];
+    if constexpr (Traits::QKWarpN == 4)
+        tile_sum = tile_sum + sPsum[2 * BM + tid] + sPsum[3 * BM + tid];
+    sRunSum[tid] = SingleTile ? tile_sum : sRunSum[tid] * sScale[tid] + tile_sum;
+}
+
+template <class Traits, int BM, int BN, class PVSlice, class PFragment, class PVMma, class Output>
+__device__ __forceinline__ void accumulate_pv(const PVSlice &tpv, PFragment &rP, PVMma &mpv, Output &acc_o,
+    E4M3 *pK, int ptsm0, int voff, int stage_offset = 0) {
+    constexpr int NTHR = Traits::Threads, NK_PV = BN / 32;
+    const int qk_lbo_a = 1, qk_sbo_a = 32;
+    Tensor rV = tpv.partition_fragment_B(
+        make_tensor(make_smem_ptr(pK), Layout<Shape<Int<DV>, Int<BN>>, Stride<_1, Int<DV>>>{}));
+    CUTE_UNROLL
+    for (int k = 0; k < NK_PV; ++k) {
+        CUTE_UNROLL
+        for (int n = 0; n < DV / (NTHR / 2); ++n) {
+            const int ub = UNIF(stage_offset + n * (NTHR / 2 * BN) + k * (4 * 512));
+            const auto *vb = reinterpret_cast<const uint8_t *>(pK) + ub;
+            uint32_t a = *(const uint32_t *)(vb + voff);
+            uint32_t b = *(const uint32_t *)(vb + voff + 1024);
+            uint32_t c = *(const uint32_t *)(vb + voff + 8);
+            uint32_t d = *(const uint32_t *)(vb + voff + 1032);
+            auto *rv = (uint32_t *)&rV(0, n, k);
+            rv[0] = ppu_mat_trans_b8(a);
+            rv[1] = ppu_mat_trans_b8(b);
+            rv[2] = ppu_mat_trans_b8(c);
+            rv[3] = ppu_mat_trans_b8(d);
+        }
+        CUTE_UNROLL
+        for (int m2 = 0; m2 < BM / 16; ++m2)
+            PPU_LDM((uint32_t *)&rP(0, m2, k), ptsm0 + (k >> 1) * (BM * 4) + m2 * 64 + (k & 1) * 2,
+                qk_lbo_a, qk_sbo_a);
+        __ppu_sched_bound();
+        cute::gemm(mpv, rP(_, _, k), rV(_, _, k), acc_o);
+    }
+}
+
+template <class Gather>
+__device__ __forceinline__ void prime_kv_pipeline(Gather &&gather) {
+    gather(0);
+    cute::cp_async_fence();
+    cute::cp_async_wait<0>();
+    __syncthreads();
+}
+
+template <class Gather>
+__device__ __forceinline__ void prefetch_next_kv(Gather &&gather, int tile, int tiles) {
+    if (tile + 1 < tiles) {
+        gather(tile + 1);
+        cute::cp_async_fence();
+    }
+}
+
+__device__ __forceinline__ void wait_next_kv(int tile, int tiles) {
+    if (tile + 1 < tiles) {
+        cute::cp_async_wait<0>(); // Next KV stage has landed.
+        __syncthreads();         // Current PV readers released the other stage.
+    }
+}
+
 template <int BlockM, int DenseThreads, int BlockN = 64> struct Fp8SparsePrefillTraits {
     static constexpr int BN = BlockN;
     static_assert(BlockM == 16 || BlockM == 64, "unsupported head tile");
@@ -122,7 +345,7 @@ __global__ __launch_bounds__(Fp8SparsePrefillTraits<BM, DenseThreads, BlockN>::T
     const int *extra_ids = nullptr, const int *extra_lengths = nullptr,
     int primary_width = 0, int primary_rows = 0, int request_queries = 1) {
     using Traits = Fp8SparsePrefillTraits<BM, DenseThreads, BlockN>;
-    constexpr int BN = BlockN, NK_PV = BN / 32;
+    constexpr int BN = BlockN;
     constexpr bool SingleTile = BlockN == 128;
     constexpr bool COMPACT = Traits::Compact;
     static_assert(LogicalHeads == BM || (BM == 16 && LogicalHeads == 8),
@@ -347,16 +570,10 @@ __global__ __launch_bounds__(Fp8SparsePrefillTraits<BM, DenseThreads, BlockN>::T
             PPU_LDM((uint32_t *)&rQ(0, 0, k), qtsm0 + (k >> 1) * (BM * 4) + (k & 1) * 2, qk_lbo_a,
                 qk_sbo_a);
     }
-    issue_K(0);
-    cute::cp_async_fence();
-    cute::cp_async_wait<0>();
-    __syncthreads();
+    flashmla_fp8_std::prime_kv_pipeline(issue_K);
 
     for (int t = 0; t < active_tiles; ++t) {
-        if (t + 1 < active_tiles) {
-            issue_K(t + 1);
-            cute::cp_async_fence();
-        }
+        flashmla_fp8_std::prefetch_next_kv(issue_K, t, active_tiles);
 
         Tensor acc_s = tqk.partition_fragment_C(sPt);
         clear(acc_s);
@@ -427,39 +644,12 @@ __global__ __launch_bounds__(Fp8SparsePrefillTraits<BM, DenseThreads, BlockN>::T
             if (tid == 0)
                 *sFlag = 0;
 
-            float mx[2] = {NEG_INF, NEG_INF};
-            CUTE_UNROLL
-            for (int e = 0; e < ScoreValues; ++e) {
-                int s = Traits::score_row_offset(e) ? 1 : 0;
-                mx[s] = fmaxf(mx[s], acc_s(e)); // raw; scaled once in the combine
-            }
-#pragma unroll
-            for (int s = 0; s < 2; ++s) {
-                mx[s] = fmaxf(mx[s], __shfl_xor_sync(0xffffffff, mx[s], 1));
-                mx[s] = fmaxf(mx[s], __shfl_xor_sync(0xffffffff, mx[s], 2));
-            }
-            if ((lane & 3) == 0) {
-                sPmax[wn * BM + r0] = mx[0];
-                sPmax[wn * BM + r1] = mx[1];
-            }
+            flashmla_fp8_std::reduce_score_max<Traits, BM, ScoreValues>(acc_s, sPmax, lane, wn, r0, r1);
         } // All participating QK warps reconverge before the block barrier.
         __syncthreads();
         if constexpr (!SingleTile) {
         if (tid < BM) {
-            float m = fmaxf(sPmax[tid], sPmax[BM + tid]);
-            if constexpr (Traits::QKWarpN == 4)
-                m = fmaxf(m, fmaxf(sPmax[2 * BM + tid], sPmax[3 * BM + tid]));
-            m *= qk_scale_log2;
-            float mprev = sRunMax[tid];
-            // Quantise the running max to whole exp2 steps: the correction factor
-            // becomes an exact power of two and, more importantly, stays at 1 for
-            // most tiles, so the 64-multiply acc_o rescale is skipped.
-            float mnew = fmaxf(mprev, ceilf(m));
-            sRunMax[tid] = mnew;
-            float sc = (mprev == NEG_INF) ? 1.f : exp2f(mprev - mnew);
-            sScale[tid] = sc;
-            if (sc != 1.f)
-                *sFlag = 1;
+            flashmla_fp8_std::update_running_max<Traits, BM>(sPmax, sRunMax, sScale, sFlag, tid, qk_scale_log2);
         }
         __syncthreads();
 
@@ -483,85 +673,26 @@ __global__ __launch_bounds__(Fp8SparsePrefillTraits<BM, DenseThreads, BlockN>::T
                 mx0 = sRunMax[r0];
                 mx1 = sRunMax[r1];
             }
-            float sm[2] = {0.f, 0.f};
-            Tensor cP = tqk.partition_C(sPt);
-            // cP(e) and cP(e+1) are n and n+1 of the same row, hence physically
-            // adjacent inside one 16-byte swizzle granule: pack them into one 2-byte
-            // store to halve the store count and the store bank conflicts.
-            CUTE_UNROLL
-            for (int e = 0; e < ScoreValues; e += 2) {
-
-                int s = Traits::score_row_offset(e) ? 1 : 0;
-                float mxs = s ? mx1 : mx0;
-                const float bias = LOG2_P_SCALE - mxs;
-                float v0 = exp2f(fmaf(acc_s(e), qk_scale_log2, bias));
-                float v1 = exp2f(fmaf(acc_s(e + 1), qk_scale_log2, bias));
-                sm[s] += v0 + v1; // sums already carry P_SCALE
-                const __hg_fp8x2_storage_t packed =
-                    flashmla::sparse_native_fp8::pack_e4m3_pair(make_float2(v0, v1));
-                *reinterpret_cast<__hg_fp8x2_storage_t *>(&cP(e)) = packed;
-            }
-#pragma unroll
-            for (int s = 0; s < 2; ++s) {
-                sm[s] += __shfl_xor_sync(0xffffffff, sm[s], 1);
-                sm[s] += __shfl_xor_sync(0xffffffff, sm[s], 2);
-            }
-            if ((lane & 3) == 0) {
-                sPsum[wn * BM + r0] = sm[0];
-                sPsum[wn * BM + r1] = sm[1];
-            }
+            flashmla_fp8_std::quantize_probability<Traits, BM, ScoreValues>(
+                acc_s, tqk, sPt, sPsum, lane, wn, r0, r1, mx0, mx1, qk_scale_log2);
         }
 
         if (!SingleTile && *sFlag) {
-            float os[BM / 8];
-#pragma unroll
-            for (int j = 0; j < BM / 8; ++j)
-                os[j] = sScale[j * 8 + mi];
-            CUTE_UNROLL
-            for (int e = 0; e < size(acc_o); ++e)
-                acc_o(e) *= os[Traits::output_row(e) >> 3];
+            flashmla_fp8_std::rescale_output<Traits, BM>(acc_o, sScale, mi);
         }
         __syncthreads();
 
         if (tid < BM) {
-            float tile_sum = sPsum[tid] + sPsum[BM + tid];
-            if constexpr (Traits::QKWarpN == 4)
-                tile_sum = tile_sum + sPsum[2 * BM + tid] + sPsum[3 * BM + tid];
-            sRunSum[tid] = SingleTile ? tile_sum : sRunSum[tid] * sScale[tid] + tile_sum;
+            flashmla_fp8_std::update_running_sum<Traits, BM, SingleTile>(sPsum, sRunSum, sScale, tid);
         }
 
         // Accumulate PV directly in the running output fragment.
         // Fragment storage follows the logical PV operand shape. Actual loads
         // transpose four-byte pieces from the swizzled KV stage into that shape.
-        Tensor rV = tpv.partition_fragment_B(
-            make_tensor(make_smem_ptr(pK), Layout<Shape<Int<DV>, Int<BN>>, Stride<_1, Int<DV>>>{}));
-        CUTE_UNROLL
-        for (int k = 0; k < NK_PV; ++k) {
-            CUTE_UNROLL
-            for (int n = 0; n < DV / (NTHR / 2); ++n) {
-                const int ub = UNIF((t & 1) * KTILE + n * (NTHR / 2 * BN) + k * (4 * 512));
-                const auto *vb = reinterpret_cast<const uint8_t *>(pK) + ub;
-                uint32_t a = *(const uint32_t *)(vb + voff);
-                uint32_t b = *(const uint32_t *)(vb + voff + 1024);
-                uint32_t c = *(const uint32_t *)(vb + voff + 8);
-                uint32_t d = *(const uint32_t *)(vb + voff + 1032);
-                auto *rv = (uint32_t *)&rV(0, n, k);
-                rv[0] = ppu_mat_trans_b8(a);
-                rv[1] = ppu_mat_trans_b8(b);
-                rv[2] = ppu_mat_trans_b8(c);
-                rv[3] = ppu_mat_trans_b8(d);
-            }
-            CUTE_UNROLL
-            for (int m2 = 0; m2 < BM / 16; ++m2)
-                PPU_LDM((uint32_t *)&rP(0, m2, k), ptsm0 + (k >> 1) * (BM * 4) + m2 * 64 + (k & 1) * 2, qk_lbo_a, qk_sbo_a);
-            __ppu_sched_bound();
-            cute::gemm(mpv, rP(_, _, k), rV(_, _, k), acc_o);
-        }
+        flashmla_fp8_std::accumulate_pv<Traits, BM, BN>(
+            tpv, rP, mpv, acc_o, pK + (t & 1) * KTILE, ptsm0, voff);
 
-        if (t + 1 < active_tiles) {
-            cute::cp_async_wait<0>(); // Next KV stage has landed.
-            __syncthreads();          // Current PV readers have released the other stage.
-        }
+        flashmla_fp8_std::wait_next_kv(t, active_tiles);
     }
     // Publish the final running sum before any PV warp consumes it.
     __syncthreads();
@@ -612,35 +743,31 @@ __global__ __launch_bounds__(Fp8SparsePrefillTraits<BM, DenseThreads, BlockN>::T
 
 // ---------------------------------------------------------------------------
 
-template <int D, int Threads, bool Trusted, int Prefix = 0, int GatherLanes = 8, bool GuardGatherReuse = false>
-void launch(const void *q, const void *kv, const int *idx, void *out, float *maxima, float *lse,
-    const float *sink, const int *lengths, float scale, float os, int queries, int tiles,
-    int kvrows, hggcStream_t stream, int heads = 64, int lse_queries = 0) {
+template <int D, int Threads, bool Trusted, int Prefix = 0, int GatherLanes = 8,
+          bool GuardGatherReuse = false>
+void launch(const flashmla::sparse_native_fp8::AttentionParams &params) {
     constexpr int Shared = 3 * 64 * D + 64 * 64 + 2176 * 4 + 11 * 64 * 4 + 256;
-    auto kernel = flash_fwd_sparse_fp8_std_kernel<64, D, Trusted, Threads, Prefix, false, 64, 64, false, GatherLanes, false, GuardGatherReuse>;
+    auto kernel = flash_fwd_sparse_fp8_std_kernel<64, D, Trusted, Threads, Prefix, false, 64, 64,
+                                                  false, GatherLanes, false, GuardGatherReuse>;
     hggcFuncSetAttribute(kernel, hggcFuncAttributeMaxDynamicSharedMemorySize, Shared);
-    kernel<<<dim3(int64_t(queries) * (heads / 64)), Threads, Shared, stream>>>(q, static_cast<const E4M3 *>(kv), idx,
-        static_cast<cutlass::bfloat16_t *>(out), scale, tiles, kvrows, os, heads, maxima, lse, sink,
-        lengths, nullptr, lse_queries, nullptr, nullptr, nullptr, 0, 0, 1);
+    kernel<<<dim3(int64_t(params.queries) * (params.heads / 64)), Threads, Shared, params.stream>>>(
+        params.q, static_cast<const E4M3 *>(params.kv), params.idx,
+        static_cast<cutlass::bfloat16_t *>(params.out), params.scale, (params.width / 64),
+        params.kvrows, params.os, params.heads, params.maxima, params.lse, params.sink,
+        params.lengths, nullptr, params.lse_queries, nullptr, nullptr, nullptr, 0, 0, 1);
 }
 template <int Threads, int Prefix = 0, int GatherLanes = 8, bool GuardGatherReuse = false>
-void dispatch(const void *q, const void *kv, const int *idx, void *out, float *maxima, float *lse,
-    const float *sink, const int *lengths, float scale, float os, int dim, int queries, int tiles,
-    int kvrows, bool trusted, hggcStream_t stream, int heads = 64, int lse_queries = 0) {
-    if (dim == 512) {
-        if (trusted)
-            launch<512, Threads, true, Prefix, GatherLanes>(q, kv, idx, out, maxima, lse, sink, lengths,
-                scale, os, queries, tiles, kvrows, stream, heads, lse_queries);
+void dispatch(const flashmla::sparse_native_fp8::AttentionParams &params) {
+    if (params.dim == 512) {
+        if (params.trusted_full_topk)
+            launch<512, Threads, true, Prefix, GatherLanes>(params);
         else
-            launch<512, Threads, false, Prefix, GatherLanes>(q, kv, idx, out, maxima, lse, sink,
-                lengths, scale, os, queries, tiles, kvrows, stream, heads, lse_queries);
+            launch<512, Threads, false, Prefix, GatherLanes>(params);
     } else {
-        if (trusted)
-            launch<576, Threads, true, Prefix, GatherLanes, GuardGatherReuse>(q, kv, idx, out, maxima, lse, sink, lengths,
-                scale, os, queries, tiles, kvrows, stream, heads, lse_queries);
+        if (params.trusted_full_topk)
+            launch<576, Threads, true, Prefix, GatherLanes, GuardGatherReuse>(params);
         else
-            launch<576, Threads, false, Prefix, GatherLanes, GuardGatherReuse>(q, kv, idx, out, maxima, lse, sink,
-                lengths, scale, os, queries, tiles, kvrows, stream, heads, lse_queries);
+            launch<576, Threads, false, Prefix, GatherLanes, GuardGatherReuse>(params);
     }
 }
 } // namespace flashmla_fp8_std
@@ -1182,3 +1309,5 @@ struct Pipeline {
 };
 
 } // namespace flashmla::sparse_native_fp8::ws
+
+#endif // __HGGCCC__

@@ -2,15 +2,11 @@
 
 #include "ppu/sparse_native_fp8_attention.cuh"
 
-void run_native_d512_h8_fallback(const void *, const void *, const int *, void *, float *, float *,
-    const float *, const int *, const int *, float, int, int, int, hggcStream_t, int, int);
+void run_native_d512_h8_fallback(const flashmla::sparse_native_fp8::AttentionParams &params);
 
-void run_native_d512_h16_fallback(const void *, const void *, const int *, void *, float *, float *,
-    const float *, const int *, const int *, float, int, int, int, hggcStream_t, int, int);
+void run_native_d512_h16_fallback(const flashmla::sparse_native_fp8::AttentionParams &params);
 
-void run_native_d512_dual_compact(const void *, const void *, const int *, const void *,
-    const int *, void *, float *, const float *, const int *, const int *, const int *,
-    float, int, int, int, int, int, int, hggcStream_t, int, int);
+void run_native_d512_dual_compact(const flashmla::sparse_native_fp8::AttentionParams &params);
 
 namespace flashmla_fp8_attention {
 using namespace flashmla::sparse_native_fp8::ws;
@@ -122,62 +118,57 @@ __global__ __launch_bounds__(2 * (BM / 16) * 4 * 32, BM <= 32 ? 2 : 1) void nati
             s, out, sink, length, outscale, active);
 }
 
-template <int D, int ST, int BM, int Rows = 1, bool Late = false, int Prefix = 0,
-    bool Dual = false, bool Gated = false, int GatherLanes = 0, bool PairedV = false>
-void launch_attention(const void *q, const void *kv, const int *idx, void *out, float *mx, float *lse,
-    const float *sink, const int *lengths, float scale, float os, int queries, int width,
-    int kvrows, int heads, bool qbf, int qst, int qsh, hggcStream_t stream, int splits = 1,
-    const void *extra = nullptr, const int *extra_ids = nullptr, const int *extra_lengths = nullptr,
-    int primary_width = 0, int extra_width = 0, int primary_rows = 0, int lse_queries = 0,
-    const int *errors = nullptr, int qpr = 1) {
-    constexpr int Smem = Pipeline::smem_bytes<D, ST, BM, true>() + (Prefix ? BM * (D - Prefix * 32) - 24 : 0);
-    auto kernel = native_fp8_attention_kernel<D, ST, BM, Rows, Late, Prefix,
-        Dual, Gated, GatherLanes, PairedV>;
+template <int D, int ST, int BM, int Rows = 1, bool Late = false, int Prefix = 0, bool Dual = false,
+          bool Gated = false, int GatherLanes = 0, bool PairedV = false>
+void launch_attention(const flashmla::sparse_native_fp8::AttentionParams &params) {
+    constexpr int Smem =
+        Pipeline::smem_bytes<D, ST, BM, true>() + (Prefix ? BM * (D - Prefix * 32) - 24 : 0);
+    auto kernel = native_fp8_attention_kernel<D, ST, BM, Rows, Late, Prefix, Dual, Gated,
+                                              GatherLanes, PairedV>;
     hggcFuncSetAttribute(kernel, hggcFuncAttributeMaxDynamicSharedMemorySize, Smem);
-    kernel<<<dim3(int64_t(queries) * splits * ((heads + BM - 1) / BM)), 2 * (BM / 16) * 4 * 32, Smem, stream>>>(
-        q, static_cast<const F8 *>(kv), idx, static_cast<cutlass::bfloat16_t *>(out), mx, lse, sink,
-        lengths, scale, os, width, kvrows, heads, qbf, qst, qsh, splits,
-        static_cast<const F8 *>(extra), extra_ids, extra_lengths, primary_width, extra_width,
-        primary_rows, lse_queries, errors, qpr);
+    kernel<<<dim3(int64_t(params.queries) * params.splits * ((params.heads + BM - 1) / BM)),
+             2 * (BM / 16) * 4 * 32, Smem, params.stream>>>(
+        params.q, static_cast<const F8 *>(params.kv), params.idx,
+        static_cast<cutlass::bfloat16_t *>(params.out), params.maxima, params.lse, params.sink,
+        params.lengths, params.scale, params.os, params.width, params.kvrows, params.heads,
+        params.qbf, params.qst, params.qsh, params.splits, static_cast<const F8 *>(params.extra),
+        params.extra_idx, params.extra_lengths, params.primary_width, params.extra_width,
+        params.primary_rows, params.lse_queries, params.errors, params.qpr);
 }
 
 // Only the validated Warp-Interleave (WI) double/triple-buffer paths
 // are production choices.
 template <int D, int BM, bool Dual = false, bool Gated = false>
-void dispatch_attention(bool two_stage, const void *q, const void *kv, const int *idx, void *out,
-    float *maxima, float *lse, const float *sink, const int *lengths, float scale, float out_scale,
-    int queries, int width, int kv_rows, int heads, bool q_bf16, int q_stride_t, int q_stride_h,
-    hggcStream_t stream, int splits, const void *extra = nullptr,
-    const int *extra_indices = nullptr, const int *extra_lengths = nullptr, int main_width = 0,
-    int extra_width = 0, int main_rows = 0, int lse_queries = 0,
-    const int *errors = nullptr, int qpr = 1, bool cache_resident = false) {
+void dispatch_attention(const flashmla::sparse_native_fp8::AttentionParams &params) {
     constexpr int Prefix = BM == 32 ? 12 : 0;
-    auto launch = two_stage ? launch_attention<D, 2, BM, 1, false, Prefix, Dual, Gated>
-                            : launch_attention<D, 3, BM, 1, false, Prefix, Dual, Gated>;
+    auto launch = params.two_stage ? launch_attention<D, 2, BM, 1, false, Prefix, Dual, Gated>
+                                   : launch_attention<D, 3, BM, 1, false, Prefix, Dual, Gated>;
     // Keep narrow gathers for short D512 partitions; longer partitions amortize
     // the repeated rows needed for an eight-lane cooperative gather. D576 also
     // benefits from the wider gather when processing an unsplit list.
     constexpr int MinWideGatherTiles = 8;
     // A resident KV pool favors fewer gather address/row passes on the
     // three-stage small-head path. Streaming pools retain wider transactions.
-    const bool narrow_cached = D == 576 && BM == 16 && !two_stage &&
-                               splits == 1 && cache_resident;
-    if (!q_bf16 && !narrow_cached && ((D == 576 && splits == 1) ||
-            width / splits >= MinWideGatherTiles * flashmla::sparse_native_fp8::TileKeys)) {
-        launch = two_stage ? launch_attention<D, 2, BM, 1, false, Prefix, Dual, Gated, 8>
-                           : launch_attention<D, 3, BM, 1, false, Prefix, Dual, Gated, 8>;
+    const bool narrow_cached =
+        D == 576 && BM == 16 && !params.two_stage && params.splits == 1 && params.cache_resident;
+    if (!params.qbf && !narrow_cached &&
+        ((D == 576 && params.splits == 1) ||
+         params.width / params.splits >=
+             MinWideGatherTiles * flashmla::sparse_native_fp8::TileKeys)) {
+        launch = params.two_stage ? launch_attention<D, 2, BM, 1, false, Prefix, Dual, Gated, 8>
+                                  : launch_attention<D, 3, BM, 1, false, Prefix, Dual, Gated, 8>;
         if constexpr (!Dual && !Gated) {
             // M890P measurements favor the paired transpose at 32 key tiles.
             // Short partitions keep the original V fragments.
             constexpr int MinPairedVTiles = 32;
-            if (splits == 1 && width >= MinPairedVTiles * flashmla::sparse_native_fp8::TileKeys)
-                launch = two_stage ? launch_attention<D, 2, BM, 1, false, Prefix, false, false, 8, true>
-                                   : launch_attention<D, 3, BM, 1, false, Prefix, false, false, 8, true>;
+            if (params.splits == 1 &&
+                params.width >= MinPairedVTiles * flashmla::sparse_native_fp8::TileKeys)
+                launch = params.two_stage
+                             ? launch_attention<D, 2, BM, 1, false, Prefix, false, false, 8, true>
+                             : launch_attention<D, 3, BM, 1, false, Prefix, false, false, 8, true>;
         }
     }
-    launch(q, kv, idx, out, maxima, lse, sink, lengths, scale, out_scale, queries, width, kv_rows,
-        heads, q_bf16, q_stride_t, q_stride_h, stream, splits, extra, extra_indices, extra_lengths,
-        main_width, extra_width, main_rows, lse_queries, errors, qpr);
+    launch(params);
 }
 } // namespace flashmla_fp8_attention
 
@@ -244,27 +235,26 @@ __global__ __launch_bounds__(2 * (BM / 16) * 4 * 32, BM <= 32 ? 2 : 1) void nati
             sink ? sink + (Window ? 0 : head) : nullptr, width, 1.f, active);
 }
 template <int D, int H, bool QB, bool Dual = false, bool Window = false, int BM = 64>
-void launch_verify_stream(const void *q, const void *kv, const int *ids, const unsigned *masks,
-    void *out, float *mx, float *lse, const float *sink, const int *errors, float scale, int batch,
-    int width, int rows, int qpr, hggcStream_t stream,
-    const void *extra = nullptr, int primary_rows = 0, int lse_queries = 0) {
+void launch_verify_stream(const flashmla::sparse_native_fp8::AttentionParams &params) {
     if constexpr (!Window && BM == 64) {
-        const int folded_heads = qpr * H;
+        const int folded_heads = params.qpr * H;
         // Avoid a mostly padded 64-row tile for short verify groups.
         if (folded_heads <= 32) {
             auto launch = folded_heads <= 16 ? launch_verify_stream<D, H, QB, Dual, Window, 16>
-                                            : launch_verify_stream<D, H, QB, Dual, Window, 32>;
-            launch(q, kv, ids, masks, out, mx, lse, sink, errors, scale, batch,
-                width, rows, qpr, stream, extra, primary_rows, lse_queries);
+                                             : launch_verify_stream<D, H, QB, Dual, Window, 32>;
+            launch(params);
             return;
         }
     }
     constexpr int ST = 3, Smem = Pipeline::smem_bytes<D, ST, BM, true>();
     auto kernel = native_verify_stream_kernel<D, ST, H, QB, Dual, Window, BM>;
     hggcFuncSetAttribute(kernel, hggcFuncAttributeMaxDynamicSharedMemorySize, Smem);
-    kernel<<<dim3(batch, (qpr * H + BM - 1) / BM), 2 * (BM / 16) * 4 * 32, Smem, stream>>>(q, static_cast<const F8 *>(kv),
-        ids, masks, static_cast<cutlass::bfloat16_t *>(out), mx, lse, sink, errors, scale, width,
-        rows, qpr, static_cast<const F8 *>(extra), primary_rows, lse_queries);
+    kernel<<<dim3(params.batch, (params.qpr * H + BM - 1) / BM), 2 * (BM / 16) * 4 * 32, Smem,
+             params.stream>>>(
+        params.q, static_cast<const F8 *>(params.kv), params.idx, params.masks,
+        static_cast<cutlass::bfloat16_t *>(params.out), params.maxima, params.lse, params.sink,
+        params.errors, params.scale, params.width, params.kvrows, params.qpr,
+        static_cast<const F8 *>(params.extra), params.primary_rows, params.lse_queries);
 }
 
 } // namespace flashmla_fp8_attention
@@ -349,147 +339,115 @@ __global__ __launch_bounds__(256, 2) void native_verify_unfolded_kernel(const vo
         Pipeline::consume<D, Stages, BM, Rows, Late>(s, out, sink, length, outscale, active);
 }
 template <int ST, int H = 8>
-void launch_verify_unfolded(const void *q, const void *kv, const int *idx, void *out, float *mx,
-    float *lse, const float *sink, const int *lengths, const int *errors, float scale, int queries,
-    int width, int rows, bool qbf, hggcStream_t stream, int request_queries) {
+void launch_verify_unfolded(const flashmla::sparse_native_fp8::AttentionParams &params) {
     constexpr int Smem = Pipeline::smem_bytes<512, ST, 16, true>();
     auto kernel = native_verify_unfolded_kernel<ST, H>;
     hggcFuncSetAttribute(kernel, hggcFuncAttributeMaxDynamicSharedMemorySize, Smem);
-    kernel<<<queries, 256, Smem, stream>>>(q, static_cast<const F8 *>(kv), idx,
-        static_cast<cutlass::bfloat16_t *>(out), mx, lse, sink, lengths, scale, width, rows, qbf,
-        errors, request_queries);
+    kernel<<<params.queries, 256, Smem, params.stream>>>(
+        params.q, static_cast<const F8 *>(params.kv), params.idx,
+        static_cast<cutlass::bfloat16_t *>(params.out), params.maxima, params.lse, params.sink,
+        params.lengths, params.scale, params.width, params.kvrows, params.qbf, params.errors,
+        params.qpr);
 }
 } // namespace flashmla_fp8_attention
 
 template <int H, bool Dual>
-void launch_native_window(const void *q, const void *kv, const int *ids,
-    const void *extra, const int *extra_ids, void *out, float *lse, const float *sink,
-    const int *lengths, const int *extra_lengths, int *united, unsigned *masks,
-    int *errors, float scale, int batch, int qpr, int width, int padded_width,
-    int extra_width, int primary_rows, int extra_rows, hggcStream_t stream, int lse_queries) {
+void launch_native_window(const flashmla::sparse_native_fp8::AttentionParams &params) {
     using namespace flashmla_fp8_attention;
-    auto folded = qpr * H <= 16 ? launch_verify_stream<512, H, false, Dual, true, 16>
-                : qpr * H <= 32 ? launch_verify_stream<512, H, false, Dual, true, 32>
-                               : launch_verify_stream<512, H, false, Dual, true, 64>;
-    folded(q, kv, united, masks, out, nullptr,
-        lse, sink, errors, scale, batch, padded_width + extra_width,
-        primary_rows + extra_rows, qpr, stream, extra, primary_rows, lse_queries);
-    if constexpr (Dual) {
-        run_native_d512_dual_compact(q, kv, ids, extra, extra_ids, out, lse, sink,
-            lengths, extra_lengths, errors, scale, batch * qpr, H, width, extra_width,
-            primary_rows, extra_rows, stream, lse_queries, qpr);
-    } else {
-        launch_attention<512, 2, 16, 1, false, 0, Dual, true>(q, kv, ids, out,
-            nullptr, lse, sink, lengths, scale, 1.f, batch * qpr, width + extra_width,
-            primary_rows + extra_rows, H, false, H * 512, 512, stream, 1,
-            extra, extra_ids, extra_lengths, width, extra_width, primary_rows, lse_queries, errors, qpr);
+    auto folded = params.qpr * H <= 16   ? launch_verify_stream<512, H, false, Dual, true, 16>
+                  : params.qpr * H <= 32 ? launch_verify_stream<512, H, false, Dual, true, 32>
+                                         : launch_verify_stream<512, H, false, Dual, true, 64>;
+    {
+        auto view = params;
+        view.idx = params.united;
+        view.maxima = nullptr;
+        view.width = params.padded_width + params.extra_width;
+        view.kvrows = params.kvrows + params.extra_rows;
+        view.primary_rows = params.kvrows;
+        folded(view);
     }
+    if constexpr (Dual)
+        run_native_d512_dual_compact(params);
+    else
+        launch_attention<512, 2, 16, 1, false, 0, false, true>(params);
 }
 
-void run_native_fp8_attention_ws(int dim, bool dual, bool two_stage,
-    const void *q, const void *kv, const int *idx, void *out, float *maxima, float *lse,
-    const float *sink, const int *lengths, float scale, float out_scale,
-    int queries, int width, int kv_rows, int heads, bool q_bf16, int q_stride_t, int q_stride_h,
-    hggcStream_t stream, int splits, const void *extra, const int *extra_indices,
-    const int *extra_lengths, int main_width, int extra_width, int main_rows,
-    int lse_queries, const int *errors, int qpr, bool cache_resident) {
+void run_native_fp8_attention_ws(const flashmla::sparse_native_fp8::AttentionParams &params) {
     using namespace flashmla_fp8_attention;
-    auto launch = dim == 512 ? (heads <= 16 ? dispatch_attention<512, 16> : dispatch_attention<512, 32>)
-                             : (heads <= 16 ? dispatch_attention<576, 16> : dispatch_attention<576, 32>);
-    if (dual)
-        launch = heads <= 16 ? dispatch_attention<512, 16, true> : dispatch_attention<512, 32, true>;
-    launch(two_stage, q, kv, idx, out, maxima, lse, sink, lengths, scale, out_scale,
-        queries, width, kv_rows, heads, q_bf16, q_stride_t, q_stride_h, stream, splits,
-        extra, extra_indices, extra_lengths, main_width, extra_width, main_rows,
-        lse_queries, errors, qpr, cache_resident);
+    auto launch =
+        params.dim == 512
+            ? (params.heads <= 16 ? dispatch_attention<512, 16> : dispatch_attention<512, 32>)
+            : (params.heads <= 16 ? dispatch_attention<576, 16> : dispatch_attention<576, 32>);
+    if (params.extra)
+        launch = params.heads <= 16 ? dispatch_attention<512, 16, true>
+                                    : dispatch_attention<512, 32, true>;
+    launch(params);
 }
 
-void run_native_fp8_verify_ws(const void *q, const void *kv, const int *idx, void *out,
-    float *lse, const float *sink, const float *fold_sink, const int *lengths, float *maxima,
-    int *united, unsigned *masks, int *errors, float scale, int dim, int batch, int qpr, int heads,
-    int width, int kvrows, bool qbf, bool two_stage, int cache_bytes,
-    hggcStream_t stream, int lse_queries) {
-    if (dim == 576) {
-        using namespace flashmla_fp8_attention;
-        auto folded = heads == 16 ? launch_verify_stream<576, 16, false>
-                                  : launch_verify_stream<576, 8, false>;
-        folded(q, kv, united, masks, out, maxima, lse, fold_sink, errors, scale,
-            batch, width, kvrows, qpr, stream, nullptr, 0, lse_queries);
-        // Pools with effective KV reuse share ordinary decode's stage/gather
-        // selection. Streaming pools retain the wider three-stage pipeline.
+void run_native_fp8_verify_ws(const flashmla::sparse_native_fp8::AttentionParams &params) {
+    using namespace flashmla_fp8_attention;
+    auto folded_params = params;
+    folded_params.idx = params.united;
+    folded_params.sink = params.fold_sink;
+    if (params.dim == 576) {
+        auto folded = params.heads == 16 ? launch_verify_stream<576, 16, false>
+                                         : launch_verify_stream<576, 8, false>;
+        folded(folded_params);
+        // Streaming pools retain the wider three-stage pipeline. Pools with
+        // effective KV reuse share ordinary decode's stage/gather selection.
         constexpr int SparsePoolToHistoryRatio = 4;
-        const int64_t pool_rows = std::max<int64_t>(0, int64_t(kvrows) -
-            int64_t(batch) * flashmla::sparse_native_fp8::TileKeys);
-        const bool sparse_pool = pool_rows >= int64_t(batch) * width * SparsePoolToHistoryRatio;
-        if (flashmla::sparse_native_fp8::prefer_kv_reuse(int64_t(kvrows) * dim, cache_bytes) &&
+        const int64_t pool_rows =
+            std::max<int64_t>(0, int64_t(params.kvrows) -
+                                     int64_t(params.batch) * flashmla::sparse_native_fp8::TileKeys);
+        const bool sparse_pool =
+            pool_rows >= int64_t(params.batch) * params.width * SparsePoolToHistoryRatio;
+        if (flashmla::sparse_native_fp8::prefer_kv_reuse(int64_t(params.kvrows) * params.dim,
+                                                         params.cache_bytes) &&
             !sparse_pool) {
-            dispatch_attention<576, 16, false, true>(two_stage, q, kv, idx, out, maxima, lse,
-                sink, lengths, scale, 1.f, batch * qpr, width, kvrows, heads, false,
-                heads * 576, 576, stream, 1, nullptr, nullptr, nullptr, 0, 0, 0,
-                lse_queries, errors, qpr, int64_t(kvrows) * dim <= cache_bytes);
+            auto independent = params;
+            independent.cache_resident = int64_t(params.kvrows) * params.dim <= params.cache_bytes;
+            dispatch_attention<576, 16, false, true>(independent);
         } else {
-            launch_attention<576, 3, 16, 1, false, 0, false, true, 16>(q, kv, idx, out,
-                maxima, lse, sink, lengths, scale, 1.f, batch * qpr, width, kvrows,
-                heads, false, heads * 576, 576, stream, 1, nullptr, nullptr, nullptr,
-                0, 0, 0, lse_queries, errors, qpr);
+            launch_attention<576, 3, 16, 1, false, 0, false, true, 16>(params);
         }
         return;
     }
-    if (heads == 16) {
+    if (params.heads == 16) {
         // Narrow a half-empty tail while the pool benefits from KV reuse.
-        // Streaming pools use 64-row tiles to avoid rereading KV across more CTAs.
-        const int tail = (qpr * heads) % 64;
+        // Streaming pools use 64-row tiles to avoid rereading KV across CTAs.
+        const int tail = (params.qpr * params.heads) % 64;
         const bool compact_tail = flashmla::sparse_native_fp8::prefer_kv_reuse(
-            int64_t(kvrows) * dim, cache_bytes) && tail > 0 && tail <= 32;
-        using namespace flashmla_fp8_attention;
-        auto folded = qbf ? launch_verify_stream<512, 16, true>
-                          : launch_verify_stream<512, 16, false>;
+                                      int64_t(params.kvrows) * params.dim, params.cache_bytes) &&
+                                  tail > 0 && tail <= 32;
+        auto folded =
+            params.qbf ? launch_verify_stream<512, 16, true> : launch_verify_stream<512, 16, false>;
         if (compact_tail)
-            folded = qbf ? launch_verify_stream<512, 16, true, false, false, 32>
-                         : launch_verify_stream<512, 16, false, false, false, 32>;
-        folded(q, kv, united, masks, out, maxima, lse, fold_sink, errors, scale,
-            batch, width, kvrows, qpr, stream, nullptr, 0, lse_queries);
-        if (!qbf)
-            run_native_d512_h16_fallback(q, kv, idx, out, maxima, lse, sink, lengths, errors, scale,
-                batch * qpr, width / 64, kvrows, stream, lse_queries, qpr);
-        else if (two_stage)
-            flashmla_fp8_attention::launch_verify_unfolded<2, 16>(q, kv, idx, out, maxima, lse, sink,
-                lengths, errors, scale, batch * qpr, width, kvrows, qbf, stream, qpr);
+            folded = params.qbf ? launch_verify_stream<512, 16, true, false, false, 32>
+                                : launch_verify_stream<512, 16, false, false, false, 32>;
+        folded(folded_params);
+        if (!params.qbf)
+            run_native_d512_h16_fallback(params);
+        else if (params.two_stage)
+            launch_verify_unfolded<2, 16>(params);
         else
-            flashmla_fp8_attention::launch_verify_unfolded<3, 16>(q, kv, idx, out, maxima, lse, sink,
-                lengths, errors, scale, batch * qpr, width, kvrows, qbf, stream, qpr);
+            launch_verify_unfolded<3, 16>(params);
         return;
     }
-    if (qbf)
-        flashmla_fp8_attention::launch_verify_stream<512, 8, true>(q, kv, united, masks, out, maxima,
-            lse, fold_sink, errors, scale, batch, width, kvrows, qpr, stream, nullptr, 0, lse_queries);
+    auto folded =
+        params.qbf ? launch_verify_stream<512, 8, true> : launch_verify_stream<512, 8, false>;
+    folded(folded_params);
+    if (!params.qbf)
+        run_native_d512_h8_fallback(params);
+    else if (params.two_stage)
+        launch_verify_unfolded<2>(params);
     else
-        flashmla_fp8_attention::launch_verify_stream<512, 8, false>(q, kv, united, masks, out,
-            maxima, lse, fold_sink, errors, scale, batch, width, kvrows, qpr, stream, nullptr, 0, lse_queries);
-    if (!qbf) {
-        run_native_d512_h8_fallback(q, kv, idx, out, maxima, lse, sink, lengths, errors, scale,
-            batch * qpr, width / 64, kvrows, stream, lse_queries, qpr);
-        return;
-    }
-#define FALLBACK(ST)                                                                               \
-    flashmla_fp8_attention::launch_verify_unfolded<ST>(q, kv, idx, out, maxima, lse, sink, lengths,   \
-        errors, scale, batch * qpr, width, kvrows, qbf, stream, qpr)
-    if (two_stage) {
-        FALLBACK(2);
-    } else {
-        FALLBACK(3);
-    }
-#undef FALLBACK
+        launch_verify_unfolded<3>(params);
 }
 
-void run_native_fp8_window_ws(const void *q, const void *kv, const int *ids,
-    const void *extra, const int *extra_ids, void *out, float *lse, const float *sink,
-    const int *lengths, const int *extra_lengths, int *united, unsigned *masks,
-    int *errors, float scale, int batch, int qpr, int heads, int width,
-    int padded_width, int extra_width, int primary_rows, int extra_rows, hggcStream_t stream, int lse_queries) {
-    auto launch = heads == 8 ? (extra ? launch_native_window<8, true> : launch_native_window<8, false>)
-                            : (extra ? launch_native_window<16, true> : launch_native_window<16, false>);
-    launch(q, kv, ids, extra, extra_ids, out, lse, sink, lengths, extra_lengths,
-        united, masks, errors, scale, batch, qpr, width, padded_width, extra_width,
-        primary_rows, extra_rows, stream, lse_queries);
+void run_native_fp8_window_ws(const flashmla::sparse_native_fp8::AttentionParams &params) {
+    auto launch =
+        params.heads == 8
+            ? (params.extra ? launch_native_window<8, true> : launch_native_window<8, false>)
+            : (params.extra ? launch_native_window<16, true> : launch_native_window<16, false>);
+    launch(params);
 }

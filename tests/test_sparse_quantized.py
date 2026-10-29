@@ -1,4 +1,6 @@
-"""Native Q8/KV8/P8 contracts: direct APIs, paged verify and graph replay.
+"""Sparse quantized API contracts: prefill, paged verify and graph replay.
+
+The current backend uses native Q8/KV8/P8 computation.
 
 Use the FP64 oracle for output error, finite values and empty-row semantics.
 Numerical LSE proximity is deliberately not an acceptance criterion.
@@ -17,13 +19,12 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def native(kind, q, kv, indices, **kwargs):
-    scale = kwargs.pop("sm_scale", q.shape[-1] ** -0.5)
-    call = (
-        flash_mla.flash_mla_sparse_decode_fp8_fwd
-        if kind == "decode"
-        else flash_mla.flash_mla_sparse_fp8_fwd
-    )
+def quantized_attention(kind, q, kv, indices, *, sm_scale=None, **kwargs):
+    call = {
+        "prefill": flash_mla.flash_mla_sparse_quantized_fwd,
+        "decode": flash_mla.flash_mla_sparse_quantized_decode_fwd,
+    }[kind]
+    scale = q.shape[-1] ** -0.5 if sm_scale is None else sm_scale
     return call(q, kv, indices, scale, **kwargs)
 
 
@@ -105,8 +106,13 @@ def capture(call):
 def test_decode_masks_scales_graph(heads, dim):
     q, kv, ids = inputs(heads, dim)
 
+    config = flash_mla.QuantizedAttentionConfig(
+        q_scale=0.25,
+        kv_scale=2.0,
+    )
+
     def call():
-        return native("decode", q, kv, ids, q_scale=0.25, kv_scale=2.0)
+        return quantized_attention("decode", q, kv, ids, quantization=config)
 
     check(call(), reference(q, kv, ids, 0.25, 2.0))
     graph, result = capture(call)
@@ -139,13 +145,15 @@ def test_prefill_lengths_sink_preallocated(heads, dim, bf16):
     sink = torch.linspace(-3, 3, heads, device="cuda")
     sink[0], sink[-1] = -math.inf, math.inf
     out = torch.empty((5, heads, 512), device="cuda", dtype=torch.bfloat16)
-    result = native(
+    result = quantized_attention(
         "prefill",
         q,
         kv,
         ids,
-        q_scale=0.25,
-        kv_scale=2.0,
+        quantization=flash_mla.QuantizedAttentionConfig(
+            q_scale=0.25,
+            kv_scale=2.0,
+        ),
         attn_sink=sink,
         topk_length=lengths,
         out=out,
@@ -157,12 +165,12 @@ def test_prefill_lengths_sink_preallocated(heads, dim, bf16):
 @pytest.mark.parametrize("kind", ["decode", "prefill"])
 def test_uint8_empty_and_optional_statistics(kind):
     q, kv, ids = inputs()
-    plain = native(kind, q, kv, ids)
-    packed = native(kind, q.view(torch.uint8), kv.view(torch.uint8), ids)
+    plain = quantized_attention(kind, q, kv, ids)
+    packed = quantized_attention(kind, q.view(torch.uint8), kv.view(torch.uint8), ids)
     torch.testing.assert_close(plain[0], packed[0], atol=0, rtol=0)
-    assert native(kind, q[:0], kv, ids[:0])[0].shape == (0, 64, 512)
+    assert quantized_attention(kind, q[:0], kv, ids[:0])[0].shape == (0, 64, 512)
     if kind == "prefill":
-        noaux = native(kind, q, kv, ids, compute_aux=False)
+        noaux = quantized_attention(kind, q, kv, ids, compute_aux=False)
         assert noaux[1].numel() == noaux[2].numel() == 0
         torch.testing.assert_close(noaux[0], plain[0], atol=0, rtol=0)
 
@@ -183,7 +191,7 @@ def test_ws_value_column_order(path, dim):
     ids[:, :, 0] = 0
 
     def call():
-        return native("decode" if decode else "prefill", q, kv, ids)
+        return quantized_attention("decode" if decode else "prefill", q, kv, ids)
 
     graph, result = capture(call)
     for sign in (1, -1):
@@ -205,8 +213,14 @@ def test_ws_value_column_order(path, dim):
 )
 def test_invalid_scale_rejected(kind, field, value):
     q, kv, ids = inputs()
+    config = flash_mla.QuantizedAttentionConfig()
+    scale = q.shape[-1] ** -0.5
+    if field == "sm_scale":
+        scale = value
+    else:
+        setattr(config, field, value)
     with pytest.raises(RuntimeError, match="finite and positive"):
-        native(kind, q, kv, ids, **{field: value})
+        quantized_attention(kind, q, kv, ids, sm_scale=scale, quantization=config)
 
 
 @pytest.mark.parametrize("kind", ["decode", "prefill"])
@@ -215,7 +229,7 @@ def test_invalid_inputs(kind):
     bad_q = q.transpose(0, 1).contiguous().transpose(0, 1)
     for query, cache in ((q[0], kv), (q, kv[:0]), (q, kv.cpu()), (bad_q, kv)):
         with pytest.raises(RuntimeError):
-            native(kind, query, cache, ids)
+            quantized_attention(kind, query, cache, ids)
 
 
 @pytest.mark.parametrize("kind", ["prefill", "decode"])
@@ -230,20 +244,23 @@ def test_kv_storage_offset_alignment(kind, dtype, offset):
     assert shifted.is_contiguous()
     if offset % 16:
         with pytest.raises(RuntimeError, match="16-byte aligned"):
-            native(kind, q, shifted, ids)
+            quantized_attention(kind, q, shifted, ids)
         torch.cuda.synchronize()  # Rejection must not enqueue a faulting kernel.
     else:
         torch.testing.assert_close(
-            native(kind, q, shifted, ids)[0], native(kind, q, kv, ids)[0], atol=0, rtol=0
+            quantized_attention(kind, q, shifted, ids)[0],
+            quantized_attention(kind, q, kv, ids)[0],
+            atol=0,
+            rtol=0,
         )
 
 
-@pytest.mark.parametrize("kind", ["prefill", "decode", "extra", "verify", "window", "merge", "paged"])
+@pytest.mark.parametrize("kind", ["prefill", "decode", "paged", "paged_extra", "paged_extra_merge"])
 @pytest.mark.parametrize("offset", [1, 2, 4, 8])
 def test_output_storage_offset_alignment(kind, offset):
-    import flash_mla_cuda
-
-    q, kv, ids = inputs(heads=8, dim=512)
+    # D576 extra KV uses two pool launches and the backend merge.
+    dim = 576 if kind == "paged_extra_merge" else 512
+    q, kv, ids = inputs(heads=8, dim=dim)
     q, ids = q[:4], ids[:4]
     # W2048 also covers uint4 output stores in the split-KV merge.
     if kind == "decode":
@@ -254,22 +271,14 @@ def test_output_storage_offset_alignment(kind, offset):
 
     def call(output):
         if kind in ("prefill", "decode"):
-            return native(kind, q, kv, ids, out=output)
-        if kind == "extra":
-            return flash_mla_cuda.native_fp8_extra_fwd(
-                q, kv, ids, kv, ids, 512**-.5, None, None, None, output
-            )
-        if kind in ("verify", "window"):
-            return flash_mla_cuda.native_fp8_verify_fwd(
-                q, kv, ids, 2, 512**-.5, None, None, output, kind == "window"
-            )
-        if kind == "merge":
-            return flash_mla_cuda.native_fp8_merge(
-                q.to(torch.bfloat16)[:, None], torch.zeros(4, 1, 8, device="cuda"), None, output
-            )
+            return quantized_attention(kind, q, kv, ids, out=output)
+        has_extra = kind in ("paged_extra", "paged_extra_merge")
         return flash_mla.flash_mla_with_kvcache(
-            q[:, None], kv[:, None], None, None, 512, flash_mla.FlashMLASchedMeta(),
-            indices=ids, out=None if output is None else output[:, None],
+            q.view(2, 2, 8, dim), kv[:, None], None, None, 512, flash_mla.FlashMLASchedMeta(),
+            indices=ids.view(2, 2, -1),
+            out=None if output is None else output.view(2, 2, 8, 512),
+            extra_k_cache=kv[:, None] if has_extra else None,
+            extra_indices_in_kvcache=ids.view(2, 2, -1) if has_extra else None,
         )
 
     assert out.is_contiguous()
@@ -282,17 +291,6 @@ def test_output_storage_offset_alignment(kind, offset):
         assert actual.data_ptr() == out.data_ptr()
         torch.testing.assert_close(actual, call(None)[0], atol=0, rtol=0)
     assert (backing[:offset] == -123).all() and (backing[-8:] == -123).all()
-
-
-def test_merge_rejects_unaligned_partial_output():
-    import flash_mla_cuda
-
-    backing = torch.empty(4 * 2 * 8 * 512 + 1, device="cuda", dtype=torch.bfloat16)
-    part = backing[1:].view(4, 2, 8, 512)
-    lse = torch.zeros(4, 2, 8, device="cuda")
-    with pytest.raises(RuntimeError, match="part must be 16-byte aligned"):
-        flash_mla_cuda.native_fp8_merge(part, lse, None, None)
-    torch.cuda.synchronize()
 
 
 # Exercise each automatic pipeline boundary and trusted-index contract without
@@ -347,13 +345,15 @@ def test_pipeline_boundaries_graph_updates(grid, width, trusted, dim):
     sink[0], sink[-1] = -math.inf, math.inf
 
     def call():
-        return native(
+        return quantized_attention(
             "prefill",
             q,
             kv,
             ids,
-            q_scale=0.25,
-            kv_scale=2.0,
+            quantization=flash_mla.QuantizedAttentionConfig(
+                q_scale=0.25,
+                kv_scale=2.0,
+            ),
             topk_length=lengths,
             attn_sink=sink,
             trusted_full_topk=trusted,
@@ -371,16 +371,18 @@ def test_pipeline_boundaries_graph_updates(grid, width, trusted, dim):
     graph.replay()
     check(result, reference(q, kv, ids, 0.25, 2.0, lengths, sink))
     if grid == "large" and not trusted:
-        plain = native("prefill", q, kv, ids)
-        noaux = native(
+        plain = quantized_attention("prefill", q, kv, ids)
+        noaux = quantized_attention(
             "prefill", q.view(torch.uint8), kv.view(torch.uint8), ids, compute_aux=False
         )
         assert noaux[1].numel() == noaux[2].numel() == 0
         torch.testing.assert_close(noaux[0], plain[0], atol=0, rtol=0)
-        graph, noaux = capture(lambda: native("prefill", q, kv, ids, compute_aux=False))
+        graph, noaux = capture(
+            lambda: quantized_attention("prefill", q, kv, ids, compute_aux=False)
+        )
         q.copy_((torch.randn_like(q.float()) * 0.3).to(q.dtype))
         graph.replay()
-        plain = native("prefill", q, kv, ids)
+        plain = quantized_attention("prefill", q, kv, ids)
         torch.testing.assert_close(noaux[0], plain[0], atol=0, rtol=0)
 
 
@@ -410,7 +412,7 @@ def test_running_max_rescaling(dim, trusted):
         lengths[0] = 0
         lengths[1] = 1
         ids[2] = torch.arange(width, device="cuda", dtype=torch.int32)
-    fn = lambda: native(
+    fn = lambda: quantized_attention(
         "prefill", q, kv, ids, topk_length=lengths, trusted_full_topk=trusted
     )
     ans = fn()
@@ -434,88 +436,7 @@ def test_decode_auto_high_query_contract(queries, dim):
     ids = torch.randint(0, 193, (queries, 1, 128), device="cuda", dtype=torch.int32)
     ids[0] = -1
     ids[2, :, 31::47] = torch.iinfo(torch.int32).min
-    check(native("decode", q, kv, ids), reference(q, kv, ids))
-
-
-@pytest.mark.parametrize("static_scale", [None, 1.0 / 16])
-@pytest.mark.parametrize("storage_offset", [0, 1, 2])
-def test_fused_output_rope_token_offset(static_scale, storage_offset):
-    q, kv, ids = inputs(heads=64, dim=512)
-    b, h, _ = q.shape
-    plain = native("prefill", q, kv, ids, compute_aux=False)[0]
-    angle = torch.randn(4, 32, device="cuda", dtype=torch.float32)
-    freqs = torch.stack([angle.cos(), angle.sin()], dim=-1).flatten(1)
-    positions = torch.tensor([3, 0, 1, 2, 1, 0, 3, 2], device="cuda", dtype=torch.int64)
-    offset = 2
-    pos = positions[offset : offset + b]
-    x = plain.float()
-    a = x[:, :, -64:].reshape(b, h, 32, 2)
-    f = freqs[pos].reshape(b, 1, 32, 2)
-    rotated = torch.stack(
-        [
-            a[..., 0] * f[..., 0] + a[..., 1] * f[..., 1],
-            a[..., 1] * f[..., 0] - a[..., 0] * f[..., 1],
-        ],
-        dim=-1,
-    ).flatten(2)
-    x[:, :, -64:] = rotated.to(torch.bfloat16).float()
-    grouped = x.reshape(b, 8, 4096).transpose(0, 1).contiguous()
-    maxima = grouped.abs().amax(-1)
-    scale = (
-        torch.where(maxima > 0, maxima / 448.0, 1.0)
-        if static_scale is None
-        else torch.full_like(maxima, static_scale)
-    )
-    expected = (
-        (grouped / scale[:, :, None]).clamp(-448, 448).to(torch.float8_e4m3fn).float()
-    )
-    backing = torch.zeros(8 * 8 * 4096 + storage_offset, device="cuda", dtype=torch.float8_e4m3fn)
-    out8 = backing[storage_offset:].view(8, 8, 4096)
-    scales = torch.full((8, 8), -1.0, device="cuda", dtype=torch.float32)
-    if storage_offset % 2:
-        with pytest.raises(RuntimeError, match="out_fp8 must be 2-byte aligned"):
-            native(
-                "prefill", q, kv, ids, compute_aux=False, out_rope_freqs_cis=freqs,
-                out_rope_positions=positions, out_fp8=out8, out_scale=scales,
-                out_quant_heads_per_group=8, out_static_scale=static_scale,
-            )
-        torch.cuda.synchronize()
-        return
-    def call(out=None):
-        return native(
-            "prefill", q, kv, ids, out=out, compute_aux=False,
-            out_rope_freqs_cis=freqs, out_rope_positions=positions,
-            out_fp8=out8, out_scale=scales, out_quant_heads_per_group=8,
-            out_token_offset=offset, out_static_scale=static_scale,
-        )
-
-    unused_out = torch.full_like(plain, 123)
-    with pytest.raises(RuntimeError, match="fused output requires out=None"):
-        call(out=unused_out)
-    assert (unused_out == 123).all()
-    assert (out8.view(torch.uint8) == 0).all() and (scales == -1).all()
-
-    result = call()
-    assert all(t.shape == (0,) and t.device == q.device for t in result)
-    assert [t.dtype for t in result] == [torch.bfloat16, torch.float32, torch.float32]
-    graph, result = capture(call)
-    graph.replay()
-    assert all(t.shape == (0,) for t in result)
-    torch.cuda.synchronize()
-    torch.testing.assert_close(
-        scales[:, offset : offset + b], scale, atol=2e-6, rtol=2e-5
-    )
-    actual = out8[:, offset : offset + b].float() * scale[:, :, None]
-    want = expected * scale[:, :, None]
-    assert (
-        torch.linalg.vector_norm(actual - want) / torch.linalg.vector_norm(want)
-    ).item() < 0.01
-    assert (out8[:, :offset].view(torch.uint8) == 0).all() and (
-        scales[:, :offset] == -1
-    ).all()
-    assert (out8[:, offset + b :].view(torch.uint8) == 0).all() and (
-        scales[:, offset + b :] == -1
-    ).all()
+    check(quantized_attention("decode", q, kv, ids), reference(q, kv, ids))
 
 
 @pytest.mark.parametrize("queries", range(2, 10))
@@ -528,7 +449,7 @@ def test_fused_output_rope_token_offset(static_scale, storage_offset):
      (torch.float8_e4m3fn, True, 576), (torch.uint8, False, 576), (torch.uint8, True, 576)],
     ids=["q8-grouped", "q8-flat", "bf16-input", "d576-grouped", "d576-flat", "d576-raw-grouped", "d576-raw-flat"],
 )
-def test_verify_union_and_independent_fallback_graph(queries, heads, shared_history, query_dtype, flat_queries, dim):
+def test_paged_verify_layouts_graph(queries, heads, shared_history, query_dtype, flat_queries, dim):
     torch.manual_seed(14263)
     batch, width = 64, 2048
     value_dtype = torch.float8_e4m3fn if query_dtype == torch.uint8 else query_dtype
@@ -549,29 +470,21 @@ def test_verify_union_and_independent_fallback_graph(queries, heads, shared_hist
     out = torch.empty(batch, queries, heads, 512, device="cuda", dtype=torch.bfloat16)
 
     def call():
-        if query_dtype == torch.bfloat16 or not flat_queries:
-            import flash_mla_cuda
-
-            output, lse = flash_mla_cuda.native_fp8_verify_fwd(
-                q.flatten(0, 1), kv.flatten(0, 1),
-                indices.reshape(batch * queries, 1, width), queries, scale,
-                sink, None, out.flatten(0, 1),
-            )
-            return output.view_as(out), flash_mla_cuda.native_fp8_lse_to_natural(lse, batch, queries)
+        query_axis = 1 if flat_queries else queries
         output, lse = flash_mla.flash_mla_with_kvcache(
-            q.reshape(batch * queries, 1, heads, dim),
+            q.reshape(-1, query_axis, heads, dim),
             kv,
             None,
             None,
             512,
             flash_mla.FlashMLASchedMeta(),
             softmax_scale=scale,
-            indices=indices.reshape(batch * queries, 1, width),
+            indices=indices.reshape(-1, query_axis, width),
             attn_sink=sink,
-            out=out.reshape(batch * queries, 1, heads, 512),
-            num_queries_per_request=queries,
+            out=out.reshape(-1, query_axis, heads, 512),
         )
-        lse = lse.reshape(batch, queries, heads).transpose(1, 2)
+        if flat_queries:
+            lse = lse.reshape(batch, queries, heads).transpose(1, 2)
         return output.view_as(out), lse
 
     result = call()
@@ -690,7 +603,7 @@ def test_decode_grid_and_graph_replay(tokens):
     ids = ids.repeat(copies, 1, 16)[:tokens]
     # Exercise automatic split/head tiling and full-head launches across device waves.
     def call():
-        return native("decode", q, kv, ids)
+        return quantized_attention("decode", q, kv, ids)
 
     check(call(), reference(q, kv, ids))
     graph, result = capture(call)
@@ -771,12 +684,10 @@ def test_native_paged_lengths_and_graph_replay(heads, extra_width, dim, tokens, 
 @pytest.mark.parametrize("queries", range(2, 10))
 @pytest.mark.parametrize("heads", [8, 16])
 @pytest.mark.parametrize("extra_width", [0, 512])
-@pytest.mark.parametrize("flat_queries", [False, True])
-def test_window_union_masks_and_fallback_replay(queries, heads, extra_width, flat_queries):
-    import flash_mla_cuda
-
+@pytest.mark.parametrize("layout", ["grouped", "flat"])
+def test_paged_window_masks_graph_replay(queries, heads, extra_width, layout):
     torch.manual_seed(21789)
-    batch, width = (64 if flat_queries else 3), 128
+    batch, width = 64, 128
     rows = max(1024, batch * 256)
     q = (torch.randn(batch * queries, heads, 512, device="cuda") * .3).to(torch.float8_e4m3fn)
     kv = (torch.randn(rows, 1, 512, device="cuda") * .3).to(q.dtype)
@@ -805,17 +716,16 @@ def test_window_union_masks_and_fallback_replay(queries, heads, extra_width, fla
     out = torch.empty(batch * queries, heads, 512, device="cuda", dtype=torch.bfloat16)
 
     def call():
-        if flat_queries:
-            return flash_mla.flash_mla_with_kvcache(
-                q[:, None], kv.view(-1, 64, 1, 512), None, None, 512,
-                flash_mla.FlashMLASchedMeta(), indices=ids, attn_sink=sink,
-                topk_length=lengths, out=out[:, None], num_queries_per_request=queries,
-                extra_k_cache=None if extra is None else extra.view(-1, 64, 1, 512),
-                extra_indices_in_kvcache=extra_ids, extra_topk_length=extra_lengths,
-            )
-        return flash_mla_cuda.native_fp8_verify_fwd(
-            q, kv, ids, queries, 512**-.5, sink, lengths, out, True,
-            extra, extra_ids, extra_lengths,
+        query_axis = queries if layout == "grouped" else 1
+        return flash_mla.flash_mla_with_kvcache(
+            q.view(-1, query_axis, heads, 512), kv.view(-1, 64, 1, 512),
+            None, None, 512, flash_mla.FlashMLASchedMeta(),
+            indices=ids.view(-1, query_axis, width), attn_sink=sink,
+            topk_length=lengths, out=out.view(-1, query_axis, heads, 512),
+            extra_k_cache=None if extra is None else extra.view(-1, 64, 1, 512),
+            extra_indices_in_kvcache=(None if extra_ids is None else
+                                       extra_ids.view(-1, query_axis, extra_width)),
+            extra_topk_length=extra_lengths,
         )
 
     def expected():
@@ -832,7 +742,7 @@ def test_window_union_masks_and_fallback_replay(queries, heads, extra_width, fla
 
     result = call()
     assert result[0].data_ptr() == out.data_ptr()
-    check(result, expected(), natural_lse=flat_queries)
+    check(result, expected(), natural_lse=True)
     graph, result = capture(call)
     saved = ids.clone()
     # Switch a previously compatible request to an independent list. An extra
@@ -844,7 +754,7 @@ def test_window_union_masks_and_fallback_replay(queries, heads, extra_width, fla
     lengths[3] = 0
     graph.replay()
     torch.cuda.synchronize()
-    check(result, expected(), natural_lse=flat_queries)
+    check(result, expected(), natural_lse=True)
     ids.copy_(saved)
     if extra_width:
         grouped = extra_ids.view(batch, queries, extra_width)
@@ -853,14 +763,13 @@ def test_window_union_masks_and_fallback_replay(queries, heads, extra_width, fla
     lengths.fill_(width)
     graph.replay()
     torch.cuda.synchronize()
-    check(result, expected(), natural_lse=flat_queries)
+    check(result, expected(), natural_lse=True)
     ids.fill_(-1)
     if extra_width:
         extra_ids.fill_(-1)
     graph.replay()
     torch.cuda.synchronize()
-    is_empty_lse = torch.isposinf if flat_queries else torch.isneginf
-    assert (result[0] == 0).all() and is_empty_lse(result[1]).all()
+    assert (result[0] == 0).all() and torch.isposinf(result[1]).all()
 
 
 @pytest.mark.parametrize("batch,queries", [(0, 1), (4, 0)])
@@ -894,7 +803,7 @@ def test_prefill_two_head_groups_large_grid(queries):
     ids = torch.full((queries, 1, width), -1, device="cuda", dtype=torch.int32)
     lengths = torch.zeros(queries, device="cuda", dtype=torch.int32)
     out = torch.full((queries, heads, 512), torch.nan, device="cuda", dtype=torch.bfloat16)
-    result = native("prefill", q, kv, ids, topk_length=lengths, out=out)
+    result = quantized_attention("prefill", q, kv, ids, topk_length=lengths, out=out)
     assert result[0].data_ptr() == out.data_ptr()
     assert (result[0] == 0).all() and torch.isneginf(result[-1]).all()
 
@@ -921,15 +830,14 @@ def test_native_paged_grid_exceeds_y_limit(width, extra_width):
     assert (output == 0).all() and torch.isposinf(lse).all()
 
 
-@pytest.mark.parametrize("batch,queries,grouping", [(5, 1, 2), (2, 3, 2), (2, 3, 0)])
-def test_native_paged_rejects_invalid_request_grouping(batch, queries, grouping):
-    q = torch.empty(batch, queries, 8, 512, device="cuda", dtype=torch.float8_e4m3fn)
+def test_native_paged_rejects_unsupported_batch_invariance():
+    q = torch.empty(2, 3, 8, 512, device="cuda", dtype=torch.float8_e4m3fn)
     kv = torch.empty(1, 64, 1, 512, device="cuda", dtype=q.dtype)
-    ids = torch.zeros(batch, queries, 128, device="cuda", dtype=torch.int32)
-    with pytest.raises(ValueError):
+    ids = torch.zeros(2, 3, 128, device="cuda", dtype=torch.int32)
+    with pytest.raises(NotImplementedError, match="enable_batch_invariant"):
         flash_mla.flash_mla_with_kvcache(
             q, kv, None, None, 512, flash_mla.FlashMLASchedMeta(),
-            indices=ids, num_queries_per_request=grouping,
+            indices=ids, enable_batch_invariant=True,
         )
 
 
@@ -1045,10 +953,14 @@ def test_flat_split_statistics_and_graph_replay(heads, width, packed):
     out = torch.empty(4, heads, 512, device="cuda", dtype=torch.bfloat16)
 
     def call(aux=True):
-        return native(
+        return quantized_attention(
             "prefill", q.view(torch.uint8) if packed else q,
             kv.view(torch.uint8) if packed else kv, ids,
-            sm_scale=1 / 512, q_scale=0.5, kv_scale=2.0,
+            sm_scale=1 / 512,
+            quantization=flash_mla.QuantizedAttentionConfig(
+                q_scale=0.5,
+                kv_scale=2.0,
+            ),
             topk_length=lengths, attn_sink=sink, out=out if aux else None,
             compute_aux=aux,
         )
@@ -1088,3 +1000,124 @@ def test_flat_split_statistics_and_graph_replay(heads, width, packed):
     active = counts > 0
     expected = counts[active].float().log2()[:, None].expand(-1, heads)
     torch.testing.assert_close(result[2][active], expected, atol=1e-4, rtol=0)
+
+
+@pytest.mark.parametrize("kind", ["prefill", "decode"])
+@pytest.mark.parametrize("storage", ["typed", "bytes", "bf16"])
+def test_quantized_storage_and_scale_contract(kind, storage):
+    q, kv, ids = inputs(heads=16, dim=512, bf16=storage == "bf16")
+    if storage == "bytes":
+        q, kv = q.view(torch.uint8), kv.view(torch.uint8)
+    if kind == "decode" and storage == "bf16":
+        kv = kv.to(torch.float8_e4m3fn)
+    config = flash_mla.QuantizedAttentionConfig(
+        q_storage="bf16" if q.dtype == torch.bfloat16 else "e4m3",
+        kv_storage="bf16" if kv.dtype == torch.bfloat16 else "e4m3",
+        q_scale=0.75,
+        kv_scale=1.25,
+    )
+    call = (flash_mla.flash_mla_sparse_quantized_fwd if kind == "prefill"
+            else flash_mla.flash_mla_sparse_quantized_decode_fwd)
+    actual = call(q, kv, ids, 512**-0.5, quantization=config)
+    ref, _ = reference(q.view(torch.float8_e4m3fn) if storage == "bytes" else q,
+                       kv.view(torch.float8_e4m3fn) if storage == "bytes" else kv,
+                       ids, qs=0.75, ks=1.25)
+    assert torch.isfinite(actual[0]).all()
+    assert (actual[0].double() - ref).norm() / ref.norm() < 0.03
+
+
+@pytest.mark.parametrize("kind", ["prefill", "decode"])
+@pytest.mark.parametrize("invalid", ["compute", "probability", "storage"])
+def test_quantized_configuration_rejects_unsupported_backends(kind, invalid):
+    q, kv, ids = inputs()
+    config = flash_mla.QuantizedAttentionConfig()
+    if invalid == "compute":
+        config.qk_compute = "e2m1"
+    elif invalid == "probability":
+        config.probability = "e2m1"
+    else:
+        config.q_storage = "bf16"
+    call = (flash_mla.flash_mla_sparse_quantized_fwd if kind == "prefill"
+            else flash_mla.flash_mla_sparse_quantized_decode_fwd)
+    with pytest.raises(RuntimeError, match="quantized attention"):
+        call(q, kv, ids, 512**-0.5, quantization=config)
+
+
+@pytest.mark.parametrize("kind", ["prefill", "decode"])
+@pytest.mark.parametrize("operand", ["q", "kv"])
+@pytest.mark.parametrize("layout", ["tensor", "scalar_tensor", "block"])
+@pytest.mark.parametrize("construction", ["constructor", "attribute"])
+def test_quantized_rejects_unsupported_scale_layout(kind, operand, layout, construction):
+    q, kv, ids = inputs()
+    field = f"{operand}_scale"
+    if layout == "block":
+        fields = {f"{field}_block_shape": [1, 128]}
+    else:
+        scale = torch.ones(() if layout == "scalar_tensor" else (1,), device="cuda")
+        fields = {field: scale}
+    config = (flash_mla.QuantizedAttentionConfig(**fields) if construction == "constructor"
+              else flash_mla.QuantizedAttentionConfig())
+    if construction == "attribute":
+        for name, value in fields.items():
+            setattr(config, name, value)
+    if layout != "block":
+        # A scalar tensor must stay a tensor, rather than being copied to a host
+        # number implicitly by the binding (which would also break graph capture).
+        stored = getattr(config, field)
+        assert isinstance(stored, torch.Tensor)
+        assert stored.data_ptr() == scale.data_ptr() and stored.shape == scale.shape
+    with pytest.raises(RuntimeError, match="per-tensor scalar scales only"):
+        quantized_attention(kind, q, kv, ids, quantization=config)
+    torch.cuda.synchronize()
+
+
+def test_quantized_configuration_has_one_public_type():
+    import flash_mla_cuda
+
+    assert flash_mla.QuantizedAttentionConfig is flash_mla_cuda.QuantizedAttentionConfig
+    assert not hasattr(flash_mla, "QuantizationScale")
+    assert not hasattr(flash_mla_cuda, "QuantizationScale")
+    assert "QuantizationScale" not in flash_mla.__all__
+
+
+@pytest.mark.parametrize("kind", ["prefill", "decode"])
+@pytest.mark.parametrize("storage", ["typed", "bytes", "bf16"])
+def test_quantized_default_configuration(kind, storage):
+    q, kv, ids = inputs(heads=16, dim=512, bf16=storage == "bf16")
+    if storage == "bytes":
+        q, kv = q.view(torch.uint8), kv.view(torch.uint8)
+    if kind == "decode" and storage == "bf16":
+        kv = kv.to(torch.float8_e4m3fn)
+    default = quantized_attention(kind, q, kv, ids)
+    explicit = quantized_attention(
+        kind, q, kv, ids, quantization=flash_mla.QuantizedAttentionConfig()
+    )
+    torch.testing.assert_close(default, explicit, atol=0, rtol=0)
+    check(
+        default,
+        reference(
+            q.view(torch.float8_e4m3fn) if storage == "bytes" else q,
+            kv.view(torch.float8_e4m3fn) if storage == "bytes" else kv,
+            ids,
+        ),
+    )
+
+
+@pytest.mark.parametrize("kind", ["prefill", "decode"])
+@pytest.mark.parametrize("field", ["q_scale", "kv_scale"])
+def test_quantized_rejects_legacy_scalar_keywords(kind, field):
+    q, kv, ids = inputs()
+    with pytest.raises(TypeError, match=f"unexpected keyword argument '{field}'"):
+        quantized_attention(kind, q, kv, ids, **{field: 1.0})
+
+
+def test_retired_fp8_entry_points_are_removed():
+    import flash_mla_cuda
+    from flash_mla import flash_mla_interface
+
+    for name in ("flash_mla_sparse_fp8_fwd", "flash_mla_sparse_decode_fp8_fwd"):
+        assert not hasattr(flash_mla, name)
+        assert not hasattr(flash_mla_interface, name)
+        assert name not in flash_mla.__all__
+    for name in ("sparse_prefill_fp8_fwd", "sparse_decode_fp8_fwd"):
+        assert not hasattr(flash_mla_cuda, name)
