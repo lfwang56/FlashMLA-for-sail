@@ -96,6 +96,29 @@ void run_native_fp8_attention_merge(const flashmla::sparse_native_fp8::MergePara
 
 namespace flashmla::sparse_native_fp8 {
 
+// Host launchers share one per-thread device cache. Return no capability on
+// unsupported devices or runtime errors, so callers retain their fallback.
+struct DeviceProperties {
+    int id = -1, compute_units = 0, max_threads = 0, registers = 0, cache_bytes = 0;
+    size_t shared_bytes = 0;
+};
+
+inline const DeviceProperties *device_properties() {
+    int device = -1;
+    if (hggcGetDevice(&device) != hggcSuccess)
+        return nullptr;
+    static thread_local DeviceProperties cached;
+    if (cached.id != device) {
+        hggcDeviceProp props;
+        if (hggcGetDeviceProperties(&props, device) != hggcSuccess ||
+            props.major != 8 || props.minor != 9)
+            return nullptr;
+        cached = {device, props.multiProcessorCount, props.maxThreadsPerBlock,
+            props.regsPerMultiprocessor, props.l2CacheSize, props.sharedMemPerBlockOptin};
+    }
+    return &cached;
+}
+
 // Round to nearest even and saturate finite overflow. The actlize pair
 // converter packs adjacent P8 or FP8 output elements into one 16-bit value.
 __device__ __forceinline__ uint16_t pack_e4m3_pair(float2 value) {
@@ -161,18 +184,31 @@ static constexpr float P_SCALE = 448.f;
 static constexpr float LOG2_P_SCALE = 8.807354922f;
 using AtomS8 = decltype(composition(Swizzle<2, 4, 3>{}, Layout<Shape<_8, _64>, Stride<_64, _1>>{}));
 
+// Logical row mapping of the E4M3 QK MMA accumulator. The same mapping
+// applies to the compact, full-head and single-tile CTA schedules.
+struct ScoreRows {
+    CUTE_HOST_DEVICE static constexpr int score_row_offset(int e) {
+        return ((e >> 1) & 1) * 8;
+    }
+};
+
 // Shared arithmetic components for CTA attention. Callers retain their QK
 // participation scopes and barrier boundaries; these affect PPU code scheduling.
 // Q loading, gather, tile shape and epilogue remain compile-time kernel policies.
-template <class Traits, int BM, int ScoreValues, class Scores>
-__device__ __forceinline__ void reduce_score_max(
-    const Scores &acc_s, float *sPmax, int lane, int wn, int r0, int r1) {
-    float mx[2] = {NEG_INF, NEG_INF};
+template <class Traits, int ScoreValues, class Scores>
+__device__ __forceinline__ void accumulate_score_max(const Scores &acc_s, float (&mx)[2]) {
     CUTE_UNROLL
     for (int e = 0; e < ScoreValues; ++e) {
         int s = Traits::score_row_offset(e) ? 1 : 0;
         mx[s] = fmaxf(mx[s], acc_s(e)); // raw; scaled once in the combine
     }
+}
+
+template <class Traits, int BM, int ScoreValues, class Scores>
+__device__ __forceinline__ void reduce_score_max(
+    const Scores &acc_s, float *sPmax, int lane, int wn, int r0, int r1) {
+    float mx[2] = {NEG_INF, NEG_INF};
+    accumulate_score_max<Traits, ScoreValues>(acc_s, mx);
 #pragma unroll
     for (int s = 0; s < 2; ++s) {
         mx[s] = fmaxf(mx[s], __shfl_xor_sync(0xffffffff, mx[s], 1));
@@ -203,14 +239,11 @@ __device__ __forceinline__ void update_running_max(
         *sFlag = 1;
 }
 
-template <class Traits, int BM, int ScoreValues, class Scores, class QKSlice, class PMatrix>
-__device__ __forceinline__ void quantize_probability(Scores &acc_s, const QKSlice &tqk, PMatrix &sPt,
-    float *sPsum, int lane, int wn, int r0, int r1, float mx0, float mx1, float qk_scale_log2) {
-    float sm[2] = {0.f, 0.f};
-    Tensor cP = tqk.partition_C(sPt);
-    // cP(e) and cP(e+1) are n and n+1 of the same row, hence physically
-    // adjacent inside one 16-byte swizzle granule: pack them into one 2-byte
-    // store to halve the store count and the store bank conflicts.
+template <class Traits, int ScoreValues, class Scores, class StorePair>
+__device__ __forceinline__ void quantize_probability(const Scores &acc_s, float (&sm)[2],
+    float mx0, float mx1, float qk_scale_log2, StorePair store_pair) {
+    // Shared exp2, FP8 packing and local denominator accumulation. Callers
+    // retain their warp-reduction order and shared-memory lifetime boundaries.
     CUTE_UNROLL
     for (int e = 0; e < ScoreValues; e += 2) {
         int s = Traits::score_row_offset(e) ? 1 : 0;
@@ -221,8 +254,20 @@ __device__ __forceinline__ void quantize_probability(Scores &acc_s, const QKSlic
         sm[s] += v0 + v1; // sums already carry P_SCALE
         const __hg_fp8x2_storage_t packed =
             flashmla::sparse_native_fp8::pack_e4m3_pair(make_float2(v0, v1));
-        *reinterpret_cast<__hg_fp8x2_storage_t *>(&cP(e)) = packed;
+        store_pair(e, packed);
     }
+}
+
+template <class Traits, int BM, int ScoreValues, class Scores, class QKSlice, class PMatrix>
+__device__ __forceinline__ void quantize_probability(Scores &acc_s, const QKSlice &tqk, PMatrix &sPt,
+    float *sPsum, int lane, int wn, int r0, int r1, float mx0, float mx1, float qk_scale_log2) {
+    float sm[2] = {0.f, 0.f};
+    Tensor cP = tqk.partition_C(sPt);
+    auto store_pair = [&](int e, uint16_t packed) {
+        // Adjacent probabilities share a 16-byte swizzle granule.
+        *reinterpret_cast<__hg_fp8x2_storage_t *>(&cP(e)) = packed;
+    };
+    quantize_probability<Traits, ScoreValues>(acc_s, sm, mx0, mx1, qk_scale_log2, store_pair);
 #pragma unroll
     for (int s = 0; s < 2; ++s) {
         sm[s] += __shfl_xor_sync(0xffffffff, sm[s], 1);
@@ -309,7 +354,8 @@ __device__ __forceinline__ void wait_next_kv(int tile, int tiles) {
     }
 }
 
-template <int BlockM, int DenseThreads, int BlockN = 64> struct Fp8SparsePrefillTraits {
+template <int BlockM, int DenseThreads, int BlockN = 64>
+struct Fp8SparsePrefillTraits : ScoreRows {
     static constexpr int BN = BlockN;
     static_assert(BlockM == 16 || BlockM == 64, "unsupported head tile");
     static constexpr bool Compact = BlockM == 16;
@@ -323,10 +369,6 @@ template <int BlockM, int DenseThreads, int BlockN = 64> struct Fp8SparsePrefill
     using MmaPV = TiledMMA<MMA_Atom<PPU0015_16x16x32_F32E4M3E4M3F32_TN>,
         Layout<Shape<_1, Int<Threads / 32>, _1>>, Tile<_16, Int<Threads / 2>, _32>>;
     using LayoutP = decltype(tile_to_shape(AtomS8{}, Shape<Int<BlockM>, Int<BN>>{}));
-
-    CUTE_HOST_DEVICE static constexpr int score_row_offset(int e) {
-        return ((e >> 1) & 1) * 8;
-    }
 
     CUTE_HOST_DEVICE static constexpr int output_row(int e) {
         return (Compact ? 0 : ((e >> 3) & 3) * 16) + ((e >> 1) & 1) * 8;
@@ -827,13 +869,15 @@ struct PairedVLoad {
         dst[3] = __byte_perm(hi[2 * Half], hi[2 * Half + 1], 0x7531u);
     }
 
+    template <int KeyRows = N>
     __device__ __forceinline__ static void load(uint32_t *first, uint32_t *second,
         const F8 *base, int col, int k) {
-        // A 64-row tile uses 8x64-byte swizzled atoms. Addresses are in
+        static_assert(KeyRows >= N && KeyRows % N == 0);
+        // Key rows use 8x64-byte swizzled atoms. Addresses are in
         // 16-byte units; the two loads cover K32 x N32, shared by two N16
         // fragments. col is a warp-uniform multiple of 32.
         const int address = COOP_UNIF(int(reinterpret_cast<uintptr_t>(base) / 16) +
-            (col / 64) * 256 + (col % 64) / 16 + k * 128);
+            (col / 64) * KeyRows * 4 + (col % 64) / 16 + k * 128);
         uint32_t lo[4], hi[4];
         asm volatile("ppu.tc02.ldmatrix.swzl.sync.bulk.tensor.m8n8.x4.b16.trans "
                      "{%0,%1,%2,%3}, [%4], %5,%6,%7;"
@@ -891,11 +935,58 @@ struct DecodePolicy {
     static constexpr int IndexPadding = 4;
 };
 
-template <typename Policy, bool PairedV = false>
+template <typename Policy, bool PairedV = false, bool ConsumerPrefetch = false>
 struct Pipeline {
+    static_assert(!ConsumerPrefetch ||
+                      (PairedV && Policy::FullHeadTile && !Policy::DrainReleases),
+                  "Consumer prefetch requires the paired-V prefill schedule");
+    static constexpr bool AsyncInputStaging = ConsumerPrefetch;
+    static constexpr int IndexPadding = Policy::IndexPadding + (AsyncInputStaging ? 2 : 0);
+
+    // CTA-wide startup rendezvous. Q aliases KV slot 0 when ReuseQ is enabled.
+    static constexpr int QueryReleased = 1, InitialKvReady = 2;
+    // Each slot barrier counts both roles. PReady publishes P/alpha. In the
+    // producer-prefetch schedule, VReleased permits KV reuse. In the consumer-
+    // prefetch schedule, PrefetchedKvReady publishes KV(t+2) and releases P(t).
+    static constexpr int PReady = 4, PrefetchedKvReady = 6, VReleased = 8;
+    // Consumer-only rendezvous before overwriting KV; producer_sync uses 12.
+    static constexpr int ConsumerGatherReady = 13;
+
+    // The H16 prefill schedule lets PV issue the next KV gather. Keep QK,
+    // online softmax, P quantization and the final normalization shared with
+    // the existing producer-prefetch schedule.
+    template <int D, int Stages, int BM, int GatherLanes>
+    static __device__ __forceinline__ void gather_prefill_tile(
+        State s, const F8 *kv, int kvrows, int tile, int thread) {
+        static_assert(BM == 16 && D == 512 && Stages == 2 && GatherLanes > 0);
+        constexpr int Group = (BM / 16) * 4 * 32;
+        static_assert(GatherLanes % 4 == 0 && Group % GatherLanes == 0,
+                      "Gather lanes must cover complete 64-byte swizzle atoms");
+        constexpr int Rows = Group / GatherLanes, Repeats = N / Rows;
+        constexpr int Width = GatherLanes * 16;
+        static_assert(N % Rows == 0 && D % Width == 0,
+                      "Gather groups must cover every tile row and column");
+        auto layout = make_tensor(make_smem_ptr(s.k), LK<D>{});
+        const int row = thread / GatherLanes, col = (thread % GatherLanes) * 16;
+        CUTE_UNROLL
+        for (int r = 0; r < Repeats; ++r) {
+            const int token = s.idx[tile * N + row + r * Rows];
+            const bool valid = (unsigned)token < (unsigned)kvrows;
+            const F8 *src = kv + int64_t(valid ? token : 0) * D + col;
+            const int offset = int(reinterpret_cast<unsigned char *>(&layout(row + r * Rows, col)) -
+                                   reinterpret_cast<unsigned char *>(s.k));
+            F8 *dst = s.k + (tile % Stages) * N * D + offset;
+            CUTE_UNROLL
+            for (int j = 0; j < D / Width; ++j)
+                PPU_CP_ASYNC_CACHEGLOBAL_ZFILL<uint128_t>::copy(
+                    *reinterpret_cast<const uint128_t *>(src + j * Width),
+                    *reinterpret_cast<uint128_t *>(dst + j * Width * N), valid);
+        }
+    }
+
     template <int D, int Stages, int BM, bool ReuseQ> static constexpr int smem_bytes() {
         return (ReuseQ ? 0 : BM * D) + Stages * N * D + 2 * BM * N +
-            12 * BM * 4 + (2 + Policy::IndexPadding) * 4 + 2176 * 4;
+            12 * BM * 4 + (2 + IndexPadding) * 4 + 2176 * 4;
     }
     template <int D, int Stages, int BM, bool ReuseQ> static __device__ State shared_state(char *bytes) {
         constexpr int M = BM;
@@ -910,8 +1001,9 @@ struct Pipeline {
         s.psum = s.pmax + 4 * M;
         s.flag = reinterpret_cast<int *>(s.psum + 4 * M);
         // Decode's four padding words align the cached Q tail at s.idx + 2170
-        // to a 512-byte shared-memory cube; prefill retains its compact layout.
-        s.idx = s.flag + 2 + Policy::IndexPadding;
+        // to a 512-byte shared-memory cube. H16 prefill adds two words for
+        // 16-byte asynchronous index copies; other prefill layouts are unchanged.
+        s.idx = s.flag + 2 + IndexPadding;
         return s;
     }
 
@@ -1003,27 +1095,42 @@ struct Pipeline {
         if constexpr (ReuseQ) {
             producer_sync<G>();
         }
-        gather(0);
-        cp_async_fence();
-        cp_async_wait<0>();
-        producer_sync<G>();
+        if constexpr (ConsumerPrefetch) {
+            static_assert(ReuseQ && !Dual && !Fold);
+            // Both roles may overwrite Q's shared storage only after every
+            // producer has retained its complete Q fragment in registers.
+            __ppu_barrier_sync(QueryReleased, Threads, 15u);
+            gather_prefill_tile<D, Stages, BM, GatherLanes>(s, kv, kvrows, 0, gt);
+            cp_async_fence();
+            cp_async_wait<0>();
+            __ppu_barrier_sync(InitialKvReady, Threads, 15u);
+        } else {
+            gather(0);
+            cp_async_fence();
+            cp_async_wait<0>();
+            producer_sync<G>();
+        }
         // All N warps observe the same online maximum. Keep each warp's share of
         // the normalizer local and reduce it only after the final KV tile.
         float running_max0 = Neg, running_max1 = Neg, normalizer0 = 0.f, normalizer1 = 0.f;
         for (int t = 0; t < tiles; t++) {
             const int slot = t & 1;
-            if constexpr (Stages == 3) {
-                if (t >= 2) {
-                    __ppu_barrier_sync(8 + slot, Threads, 15u);
-                }
+            if constexpr (ConsumerPrefetch) {
+                // Ready(t) also proves the consumer has finished reading P(t-2).
+                if (t >= 2)
+                    __ppu_barrier_sync(PrefetchedKvReady + slot, Threads, 15u);
             } else {
-                if (t > 0) {
-                    __ppu_barrier_sync(8 + ((t - 1) & 1), Threads, 15u);
+                if constexpr (Stages == 3) {
+                    if (t >= 2)
+                        __ppu_barrier_sync(VReleased + slot, Threads, 15u);
+                } else {
+                    if (t > 0)
+                        __ppu_barrier_sync(VReleased + ((t - 1) & 1), Threads, 15u);
                 }
-            }
-            if (t + 1 < tiles) {
-                gather(t + 1);
-                cp_async_fence();
+                if (t + 1 < tiles) {
+                    gather(t + 1);
+                    cp_async_fence();
+                }
             }
             auto sp = make_tensor(make_smem_ptr(s.p + slot * M * N), LP<BM>{});
             auto scores = tq.partition_fragment_C(sp);
@@ -1107,8 +1214,13 @@ struct Pipeline {
                 mx0 = fmaxf(mx0, __shfl_xor_sync(0xffffffff, mx0, delta));
                 mx1 = fmaxf(mx1, __shfl_xor_sync(0xffffffff, mx1, delta));
             }
-            if (gt == 0)
-                s.flag[slot] = 0;
+            // For a full H16 tile, unconditional PV rescaling is cheaper than
+            // maintaining an atomic change flag and branching in the consumer.
+            // Multiplication by one preserves the existing output exactly.
+            if constexpr (!(Policy::FullHeadTile && BM == 16)) {
+                if (gt == 0)
+                    s.flag[slot] = 0;
+            }
             if ((lane & 3) == 0) {
                 s.pmax[wn * M + r0] = mx0;
                 s.pmax[wn * M + r1] = mx1;
@@ -1129,8 +1241,10 @@ struct Pipeline {
             if (wn == 0 && (lane & 3) == 0) {
                 s.alpha[slot * M + r0] = alpha0;
                 s.alpha[slot * M + r1] = alpha1;
-                if (alpha0 != 1.f || alpha1 != 1.f)
-                    atomicOr(s.flag + slot, 1);
+                if constexpr (!(Policy::FullHeadTile && BM == 16)) {
+                    if (alpha0 != 1.f || alpha1 != 1.f)
+                        atomicOr(s.flag + slot, 1);
+                }
             }
             float sums[2] = {0, 0};
             auto cp = tq.partition_C(sp);
@@ -1159,17 +1273,19 @@ struct Pipeline {
             // already orders the P/alpha stores before PV reads; no local group wait is
             // needed now that the per-tile denominator reduction is gone.
             __syncwarp();
-            __ppu_barrier_arrive(4 + slot, Threads, 15u);
-            if (t + 1 < tiles) {
-                cp_async_wait<0>();
-                producer_sync<G>();
+            __ppu_barrier_arrive(PReady + slot, Threads, 15u);
+            if constexpr (!ConsumerPrefetch) {
+                if (t + 1 < tiles) {
+                    cp_async_wait<0>();
+                    producer_sync<G>();
+                }
             }
         }
         // Preserve each schedule's release-barrier lifecycle at the end of the loop.
         if constexpr (Policy::DrainReleases) {
             constexpr int Pending = (Stages == 3) ? 2 : 1;
             for (int t = max(0, tiles - Pending); t < tiles; ++t)
-                __ppu_barrier_sync(8 + (t & 1), Threads, 15u);
+                __ppu_barrier_sync(VReleased + (t & 1), Threads, 15u);
         }
         if ((lane & 3) == 0) {
             s.psum[wn * M + r0] = normalizer0;
@@ -1184,9 +1300,10 @@ struct Pipeline {
             s.sum[gt] = s.psum[gt] + s.psum[M + gt] + s.psum[2 * M + gt] + s.psum[3 * M + gt];
     }
 
-    template <int D, int Stages, int BM, int Rows = 1, bool Late = false, int SinkHeads = 0>
+    template <int D, int Stages, int BM, int Rows = 1, bool Late = false, int SinkHeads = 0,
+        int GatherLanes = 0>
     static __device__ __forceinline__ void consume(State s, cutlass::bfloat16_t *out, const float *sink,
-        int length, float outscale, int active_heads = BM) {
+        int length, float outscale, int active_heads = BM, const F8 *kv = nullptr, int kvrows = 0) {
         constexpr int M = BM, G = (BM / 16) * 4 * 32, Threads = 2 * G;
         const int gt = role_lane<BM>(), lane = gt % 32, warp = COOP_UNIF(gt / 32),
                   mi = lane / 4;
@@ -1212,10 +1329,27 @@ struct Pipeline {
         const int vr = (lane & 3) * 4 + ((lane >> 2) & 3), vc = (warp / Rows) * 16 + (lane >> 4) * 4;
         const int voff = int(
             reinterpret_cast<unsigned char *>(&sk(vr, vc)) - reinterpret_cast<unsigned char *>(s.k));
+        if constexpr (ConsumerPrefetch) {
+            static_assert(PairedV && !Late && Rows == 1);
+            // Slot 1 is disjoint from the Q/slot 0 alias. Start its copy while
+            // the producer loads Q into registers, then publish both KV slots.
+            if (tiles > 1) {
+                gather_prefill_tile<D, Stages, BM, GatherLanes>(s, kv, kvrows, 1, gt);
+                cp_async_fence();
+            }
+            __ppu_barrier_sync(QueryReleased, Threads, 15u);
+            if (tiles > 1)
+                cp_async_wait<0>();
+            __ppu_barrier_sync(InitialKvReady, Threads, 15u);
+        }
         for (int t = 0; t < tiles; t++) {
             const int slot = t & 1;
-            __ppu_barrier_sync(4 + slot, Threads, 15u);
-            if (COOP_UNIF(s.flag[slot])) {
+            __ppu_barrier_sync(PReady + slot, Threads, 15u);
+            // H16 prefill always rescales after the first (zero) accumulator;
+            // other schedules skip rescaling when the running maximum is unchanged.
+            const bool rescale = ConsumerPrefetch ? t > 0
+                : (Policy::FullHeadTile && BM == 16) || COOP_UNIF(s.flag[slot]);
+            if (rescale) {
                 float factors[M / 8];
                 CUTE_UNROLL
                 for (int j = 0; j < M / 8; j++)
@@ -1260,7 +1394,7 @@ struct Pipeline {
                     load(k);
                     __ppu_sched_bound();
                     if (k == 1)
-                        __ppu_barrier_arrive(8 + slot, Threads, 15u);
+                        __ppu_barrier_arrive(VReleased + slot, Threads, 15u);
                     gemm(mp, rp(_, _, 0), rv(_, _, 0), acc);
                     __ppu_sched_bound();
                 }
@@ -1268,10 +1402,32 @@ struct Pipeline {
                 load(0);
                 load(1);
                 __ppu_sched_bound();
-                __ppu_barrier_arrive(8 + slot, Threads, 15u);
-                CUTE_UNROLL
-                for (int k = 0; k < 2; k++)
-                    gemm(mp, rp(_, _, k), rv(_, _, k), acc);
+                if constexpr (ConsumerPrefetch) {
+                    constexpr int Fragments = V / (G / (2 * Rows));
+                    CUTE_UNROLL
+                    for (int n = 0; n < Fragments; ++n) {
+                        gemm(mp, rp(_, 0, 0), rv(_, n, 0), acc(_, 0, n));
+                        if (n == Fragments / 2 - 1 && t + 2 < tiles) {
+                            // PV Cross-cut: release half of the first K32 V
+                            // fragment before issuing the next KV gather. All
+                            // consumer warps must finish their V reads before
+                            // any warp overwrites the shared slot.
+                            __ppu_barrier_sync(ConsumerGatherReady, G, 15u);
+                            gather_prefill_tile<D, Stages, BM, GatherLanes>(s, kv, kvrows, t + 2, gt);
+                            cp_async_fence();
+                        }
+                    }
+                    gemm(mp, rp(_, _, 1), rv(_, _, 1), acc);
+                    if (t + 2 < tiles) {
+                        cp_async_wait<0>();
+                        __ppu_barrier_arrive(PrefetchedKvReady + slot, Threads, 15u);
+                    }
+                } else {
+                    __ppu_barrier_arrive(VReleased + slot, Threads, 15u);
+                    CUTE_UNROLL
+                    for (int k = 0; k < 2; k++)
+                        gemm(mp, rp(_, _, k), rv(_, _, k), acc);
+                }
             }
         }
         __ppu_barrier_sync(0, Threads, 15u);

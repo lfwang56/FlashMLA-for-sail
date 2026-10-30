@@ -173,15 +173,15 @@ void dispatch_attention(const flashmla::sparse_native_fp8::AttentionParams &para
 } // namespace flashmla_fp8_attention
 
 namespace flashmla_fp8_attention {
-template <int D, int ST, int H, bool QB, bool Dual = false, bool Window = false, int BM = 64>
+template <int D, int ST, int H, bool Dual = false, bool Window = false, int BM = 64>
 __global__ __launch_bounds__(2 * (BM / 16) * 4 * 32, BM <= 32 ? 2 : 1) void native_verify_stream_kernel(const void *qraw,
     const F8 *kv, const int *ids, const unsigned *masks, cutlass::bfloat16_t *out, float *maxima,
     float *lse, const float *sink, const int *errors, float scale, int width, int kvrows, int qpr,
     const F8 *extra, int primary_rows, int lse_queries) {
-    // Qualify the native single-KV folded path independently of BF16-query
-    // compatibility, short windows and dual-KV verification.
+    // Paired V loads apply to the native single-KV folded path; short windows
+    // and dual-KV verification retain their original fragment layout.
     using VerifyPipeline = flashmla::sparse_native_fp8::ws::Pipeline<DecodePolicy,
-        !QB && !Dual && !Window && (BM >= 32)>;
+        !Dual && !Window && (BM >= 32)>;
     constexpr int G = (BM / 16) * 4 * 32, Threads = 2 * G;
     const int batch = blockIdx.x, head = blockIdx.y * BM, heads = qpr * H,
               active = min(BM, heads - head), tid = threadIdx.x;
@@ -195,16 +195,8 @@ __global__ __launch_bounds__(2 * (BM / 16) * 4 * 32, BM <= 32 ? 2 : 1) void nati
         uint128_t packed{};
         if (r < active) {
             const long offset = ((long)batch * heads + head + r) * D + c;
-            if constexpr (QB) {
-                const auto *src = static_cast<const __ppu_bfloat16_raw *>(qraw) + offset;
-                auto *pairs = reinterpret_cast<__hg_fp8x2_storage_t *>(&packed);
-                CUTE_UNROLL
-                for (int j = 0; j < 8; j++)
-                    pairs[j] = flashmla::sparse_native_fp8::pack_e4m3_pair(
-                        *reinterpret_cast<const __ppu_bfloat162_raw *>(src + 2 * j));
-            } else
-                packed =
-                    *reinterpret_cast<const uint128_t *>(static_cast<const F8 *>(qraw) + offset);
+            packed =
+                *reinterpret_cast<const uint128_t *>(static_cast<const F8 *>(qraw) + offset);
         }
         *reinterpret_cast<uint128_t *>(&sq(r, c)) = packed;
     }
@@ -234,20 +226,20 @@ __global__ __launch_bounds__(2 * (BM / 16) * 4 * 32, BM <= 32 ? 2 : 1) void nati
             state, out + ((long)batch * heads + head) * 512,
             sink ? sink + (Window ? 0 : head) : nullptr, width, 1.f, active);
 }
-template <int D, int H, bool QB, bool Dual = false, bool Window = false, int BM = 64>
+template <int D, int H, bool Dual = false, bool Window = false, int BM = 64>
 void launch_verify_stream(const flashmla::sparse_native_fp8::AttentionParams &params) {
     if constexpr (!Window && BM == 64) {
         const int folded_heads = params.qpr * H;
         // Avoid a mostly padded 64-row tile for short verify groups.
         if (folded_heads <= 32) {
-            auto launch = folded_heads <= 16 ? launch_verify_stream<D, H, QB, Dual, Window, 16>
-                                             : launch_verify_stream<D, H, QB, Dual, Window, 32>;
+            auto launch = folded_heads <= 16 ? launch_verify_stream<D, H, Dual, Window, 16>
+                                             : launch_verify_stream<D, H, Dual, Window, 32>;
             launch(params);
             return;
         }
     }
     constexpr int ST = 3, Smem = Pipeline::smem_bytes<D, ST, BM, true>();
-    auto kernel = native_verify_stream_kernel<D, ST, H, QB, Dual, Window, BM>;
+    auto kernel = native_verify_stream_kernel<D, ST, H, Dual, Window, BM>;
     hggcFuncSetAttribute(kernel, hggcFuncAttributeMaxDynamicSharedMemorySize, Smem);
     kernel<<<dim3(params.batch, (params.qpr * H + BM - 1) / BM), 2 * (BM / 16) * 4 * 32, Smem,
              params.stream>>>(
@@ -259,104 +251,12 @@ void launch_verify_stream(const flashmla::sparse_native_fp8::AttentionParams &pa
 
 } // namespace flashmla_fp8_attention
 
-namespace flashmla_fp8_attention {
-template <int ST, int H = 8>
-__global__ __launch_bounds__(256, 2) void native_verify_unfolded_kernel(const void *qraw,
-    const F8 *kv, const int *ids, cutlass::bfloat16_t *out, float *maxima, float *lse,
-    const float *sink, const int *lengths, float scale, int width, int kvrows, bool q_bf16,
-    const int *errors, int request_queries) {
-    constexpr int D = 512, BM = 16, Stages = ST, Rows = 1, Prefix = 0, heads = H, splits = 1,
-                  qstride_t = H * 512, qstride_h = 512;
-    // Enable Warp-Interleave (WI) for the independent-query verify fallback.
-    constexpr bool Late = false;
-    const float outscale = 1.f;
-
-    constexpr int G = (BM / 16) * 4 * 32, Threads = 2 * G;
-    const int tid = threadIdx.x, query = blockIdx.x / splits, part = blockIdx.x % splits,
-              head = blockIdx.y * BM, active = min(BM, heads - head);
-    if (!errors[query / request_queries])
-        return;
-    const int tile_begin = (width / 64) * part / splits,
-              tile_end = (width / 64) * (part + 1) / splits;
-    const int original_width = width;
-    ids += (long)query * original_width + tile_begin * 64;
-    out += (((long)query * splits + part) * heads + head) * 512;
-    if (sink)
-        sink += head;
-    if (maxima)
-        maxima += ((long)query * splits + part) * heads + head;
-    if (lse)
-        lse += ((long)query * splits + part) * heads + head;
-
-    const int global_length =
-        lengths ? max(0, min(original_width, lengths[query])) : original_width;
-    width = (tile_end - tile_begin) * 64;
-    const int length = COOP_UNIF(max(0, min(width, global_length - tile_begin * 64)));
-    extern __shared__ char bytes[];
-    State s = Pipeline::shared_state<D, Stages, BM, true>(bytes);
-    auto sq = make_tensor(make_smem_ptr(s.q), LQ<D, BM>{});
-    for (int i = tid; i < BM * (D / 16); i += Threads) {
-        const int r = i / (D / 16), c = i % (D / 16) * 16;
-        uint128_t packed{};
-        if (r < active) {
-            if (q_bf16) {
-                const auto *q = static_cast<const __ppu_bfloat16_raw *>(qraw) +
-                                (long)query * qstride_t + (long)(head + r) * qstride_h + c;
-                auto *pairs = reinterpret_cast<__hg_fp8x2_storage_t *>(&packed);
-                CUTE_UNROLL
-                for (int j = 0; j < 8; j++)
-                    pairs[j] = flashmla::sparse_native_fp8::pack_e4m3_pair(
-                        *reinterpret_cast<const __ppu_bfloat162_raw *>(q + j * 2));
-            } else
-                packed = *reinterpret_cast<const uint128_t *>(
-                    static_cast<const F8 *>(qraw) + ((long)query * heads + head + r) * D + c);
-        }
-        *reinterpret_cast<uint128_t *>(&sq(r, c)) = packed;
-    }
-    if (tid < BM) {
-        s.max[tid] = Neg;
-        s.sum[tid] = 0.f;
-    }
-    for (int i = tid; i < width; i += Threads) {
-        const int id = i < length ? ids[i] : -1;
-        s.idx[i] = id;
-        const unsigned valid = __ballot_sync(0xffffffff, (unsigned)id < (unsigned)kvrows);
-        if ((tid & 31) == 0)
-            s.idx[2048 + (i >> 5)] = int(valid);
-    }
-    __ppu_barrier_sync(0, Threads, 15u);
-    if (COOP_UNIF((role<BM>())) == 0) {
-        Pipeline::produce<D, Stages, BM, true, Prefix>(s, kv, length, kvrows, scale);
-        __ppu_barrier_sync(0, Threads, 15u);
-        const int gt = role_lane<BM>();
-        if (gt < active) {
-            if (maxima)
-                maxima[gt] = s.max[gt];
-            if (lse)
-                lse[gt] = s.sum[gt] > 0 ? s.max[gt] + log2f(s.sum[gt] / 448.f) : -INFINITY;
-        }
-    } else
-        Pipeline::consume<D, Stages, BM, Rows, Late>(s, out, sink, length, outscale, active);
-}
-template <int ST, int H = 8>
-void launch_verify_unfolded(const flashmla::sparse_native_fp8::AttentionParams &params) {
-    constexpr int Smem = Pipeline::smem_bytes<512, ST, 16, true>();
-    auto kernel = native_verify_unfolded_kernel<ST, H>;
-    hggcFuncSetAttribute(kernel, hggcFuncAttributeMaxDynamicSharedMemorySize, Smem);
-    kernel<<<params.queries, 256, Smem, params.stream>>>(
-        params.q, static_cast<const F8 *>(params.kv), params.idx,
-        static_cast<cutlass::bfloat16_t *>(params.out), params.maxima, params.lse, params.sink,
-        params.lengths, params.scale, params.width, params.kvrows, params.qbf, params.errors,
-        params.qpr);
-}
-} // namespace flashmla_fp8_attention
-
 template <int H, bool Dual>
 void launch_native_window(const flashmla::sparse_native_fp8::AttentionParams &params) {
     using namespace flashmla_fp8_attention;
-    auto folded = params.qpr * H <= 16   ? launch_verify_stream<512, H, false, Dual, true, 16>
-                  : params.qpr * H <= 32 ? launch_verify_stream<512, H, false, Dual, true, 32>
-                                         : launch_verify_stream<512, H, false, Dual, true, 64>;
+    auto folded = params.qpr * H <= 16   ? launch_verify_stream<512, H, Dual, true, 16>
+                  : params.qpr * H <= 32 ? launch_verify_stream<512, H, Dual, true, 32>
+                                         : launch_verify_stream<512, H, Dual, true, 64>;
     {
         auto view = params;
         view.idx = params.united;
@@ -390,8 +290,8 @@ void run_native_fp8_verify_ws(const flashmla::sparse_native_fp8::AttentionParams
     folded_params.idx = params.united;
     folded_params.sink = params.fold_sink;
     if (params.dim == 576) {
-        auto folded = params.heads == 16 ? launch_verify_stream<576, 16, false>
-                                         : launch_verify_stream<576, 8, false>;
+        auto folded = params.heads == 16 ? launch_verify_stream<576, 16>
+                                         : launch_verify_stream<576, 8>;
         folded(folded_params);
         // Streaming pools retain the wider three-stage pipeline. Pools with
         // effective KV reuse share ordinary decode's stage/gather selection.
@@ -419,29 +319,15 @@ void run_native_fp8_verify_ws(const flashmla::sparse_native_fp8::AttentionParams
         const bool compact_tail = flashmla::sparse_native_fp8::prefer_kv_reuse(
                                       int64_t(params.kvrows) * params.dim, params.cache_bytes) &&
                                   tail > 0 && tail <= 32;
-        auto folded =
-            params.qbf ? launch_verify_stream<512, 16, true> : launch_verify_stream<512, 16, false>;
+        auto folded = launch_verify_stream<512, 16>;
         if (compact_tail)
-            folded = params.qbf ? launch_verify_stream<512, 16, true, false, false, 32>
-                                : launch_verify_stream<512, 16, false, false, false, 32>;
+            folded = launch_verify_stream<512, 16, false, false, 32>;
         folded(folded_params);
-        if (!params.qbf)
-            run_native_d512_h16_fallback(params);
-        else if (params.two_stage)
-            launch_verify_unfolded<2, 16>(params);
-        else
-            launch_verify_unfolded<3, 16>(params);
+        run_native_d512_h16_fallback(params);
         return;
     }
-    auto folded =
-        params.qbf ? launch_verify_stream<512, 8, true> : launch_verify_stream<512, 8, false>;
-    folded(folded_params);
-    if (!params.qbf)
-        run_native_d512_h8_fallback(params);
-    else if (params.two_stage)
-        launch_verify_unfolded<2>(params);
-    else
-        launch_verify_unfolded<3>(params);
+    launch_verify_stream<512, 8>(folded_params);
+    run_native_d512_h8_fallback(params);
 }
 
 void run_native_fp8_window_ws(const flashmla::sparse_native_fp8::AttentionParams &params) {

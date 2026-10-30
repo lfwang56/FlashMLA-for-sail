@@ -105,15 +105,12 @@ static constexpr float P_SCALE = 448.f;
 static constexpr float LOG2_P_SCALE = 8.807354922f;
 using AtomS8 = decltype(composition(Swizzle<2, 4, 3>{}, Layout<Shape<_8, _64>, Stride<_64, _1>>{}));
 
-template <int BlockM> struct Fp8SparsePrefillTraits {
+template <int BlockM> struct Fp8SparsePrefillTraits : flashmla_fp8_std::ScoreRows {
     static_assert(BlockM == 16 || BlockM == 32 || BlockM == 64, "unsupported head tile");
     static constexpr bool Compact = BlockM < 64;
     static constexpr int Threads = Compact ? 256 : 512;
     static constexpr int QKWarpN = 4;
     static constexpr int QKThreads = (BlockM / 16) * QKWarpN * 32;
-    CUTE_HOST_DEVICE static constexpr int score_row_offset(int e) {
-        return ((e >> 1) & 1) * 8;
-    }
     static constexpr int MaxTopk = 2176;
     using MmaQK = TiledMMA<MMA_Atom<PPU0015_16x16x32_F32E4M3E4M3F32_TN>,
         Layout<Shape<Int<BlockM / 16>, _4, _1>>, Tile<Int<BlockM>, Int<BN>, _32>>;
@@ -226,8 +223,8 @@ __global__ __launch_bounds__(Fp8SparsePrefillTraits<BM>::Threads,
     // and for a 16-aligned row r%8 == 0, so the swizzle XOR key is 0.
     const int qk_lbo_a = 1, qk_sbo_a = 32;
     const int qk_lbo_b = 32, qk_sbo_b = 1;
-    // On attn45 this was exactly neutral, but attn62 sits at the register limit,
-    // so moving the address chain into scalar registers may now free vector ones.
+    // Matrix addresses are warp-uniform. Keep their address arithmetic in
+    // scalar registers to limit vector-register pressure in the QK/PV loops.
     const int qtsm0 = UNIF((int)(reinterpret_cast<uintptr_t>(pQ) / 16) + wm * 64);
     const int ktsm0 = UNIF((int)(reinterpret_cast<uintptr_t>(pK) / 16) + wn * 64);
     const int ptsm0 = UNIF((int)(reinterpret_cast<uintptr_t>(pP) / 16));
@@ -556,14 +553,11 @@ dispatch_sparse_prefill_fp8_fwd(const flashmla::sparse_native_fp8::AttentionPara
 void run_sparse_prefill_fp8_fwd(const flashmla::sparse_native_fp8::AttentionParams &params) {
     if (params.queries == 0)
         return;
-    if (params.heads % 64 == 0 && !params.qbf &&
-        params.qst == params.heads * params.dim && params.qsh == params.dim &&
-        try_sparse_fp8_std(params))
-        return;
-    if (params.heads % 64 == 0 && !params.qbf &&
-        params.qst == params.heads * params.dim && params.qsh == params.dim &&
-        try_sparse_prefill_fp8_ws(params))
-        return;
+    if ((params.heads == 16 || params.heads % 64 == 0) && !params.qbf &&
+        params.qst == params.heads * params.dim && params.qsh == params.dim) {
+        if (try_sparse_fp8_std(params) || try_sparse_prefill_fp8_ws(params))
+            return;
+    }
     // Complete 64-head groups reuse each gathered KV tile across
     // all heads, including sparse lists with a partially filled final tile.
     auto dispatch = params.heads <= 16   ? dispatch_sparse_prefill_fp8_fwd<16>

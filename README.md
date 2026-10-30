@@ -75,6 +75,8 @@ tensor scales, with logical `q_scale_block_shape` / `kv_scale_block_shape` field
 reserved for future backends. The current implementation supports E4M3 compute
 and scalar per-tensor scales only; tensor scales, nonempty block shapes and other
 formats are rejected before launch. FP4 is not implemented.
+The combined QK scale and KV output scale must be finite, positive FP32 normal
+values; values that would overflow or flush to zero are rejected before launch.
 
 The paged native API uses unit operand scales. It supports attention sinks, per-query lengths,
 preallocated BF16 output, and an additional E4M3 cache. Direct APIs return

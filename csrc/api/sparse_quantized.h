@@ -3,6 +3,7 @@
 #include "common.h"
 #include "sparse_native_fp8_config.h"
 #include <cmath>
+#include <limits>
 #include <variant>
 #include <c10/cuda/CUDAException.h>
 
@@ -50,6 +51,14 @@ struct Config {
 } // namespace flashmla::quantized_attention
 
 namespace flashmla::quantized_attention::detail {
+
+inline float checked_scale(double value, const char *name) {
+    // Kernels use FP32 with fast math: subnormal scales may be flushed to zero.
+    TORCH_CHECK(std::isfinite(value) && value >= std::numeric_limits<float>::min() &&
+                    value <= std::numeric_limits<float>::max(),
+                "quantized attention: ", name, " must be finite and positive in the FP32 normal range");
+    return static_cast<float>(value);
+}
 
 inline void check_inputs(const at::Tensor &q, const at::Tensor &kv, const at::Tensor &indices) {
     CHECK_DEVICE(q);
@@ -214,6 +223,10 @@ struct Request {
         config.validate(q, kv);
         TORCH_CHECK(std::isfinite(sm_scale) && sm_scale > 0,
                     "quantized attention: softmax scale must be finite and positive");
+        params.scale = detail::checked_scale(sm_scale * std::get<double>(config.q_scale) *
+                                                std::get<double>(config.kv_scale) * 1.4426950408889634,
+                                            "combined QK scale");
+        params.os = detail::checked_scale(std::get<double>(config.kv_scale), "KV output scale");
         check_device_capability();
         const bool prefill = mode != OutputMode::Decode;
         const auto [n, h, d, rows, width] =
@@ -239,9 +252,6 @@ struct Request {
         p.lse = mode == OutputMode::Decode || mode == OutputMode::Prefill ? lse.data_ptr<float>()
                                                                           : nullptr;
         p.maxima = mode == OutputMode::Prefill ? maxima.data_ptr<float>() : nullptr;
-        p.scale = float(sm_scale * std::get<double>(config.q_scale) *
-                        std::get<double>(config.kv_scale) * 1.4426950408889634);
-        p.os = float(std::get<double>(config.kv_scale));
         p.dim = d;
         p.queries = n;
         p.heads = h;
@@ -303,11 +313,10 @@ inline void execute_verify(Request &request, int64_t queries_per_request, bool s
     TORCH_CHECK(queries_per_request > 1 && queries_per_request <= MaxVerifyQueries &&
                     n % queries_per_request == 0,
                 "native verify: invalid queries/request");
-    TORCH_CHECK((d == 512 || (d == 576 && !shifted && !params.qbf)) && (h == 8 || h == 16),
+    TORCH_CHECK(!params.qbf, "native verify: requires E4M3 Q");
+    TORCH_CHECK((d == 512 || (d == 576 && !shifted)) && (h == 8 || h == 16),
                 "native verify: unsupported heads/dim");
     TORCH_CHECK(shifted || !params.extra, "native verify: extra pool requires window union");
-    TORCH_CHECK(!shifted || !params.qbf, "native verify: window union requires E4M3 Q");
-    TORCH_CHECK(!params.lse_queries || !params.qbf, "native verify: invalid paged LSE query count");
     params.qpr = queries_per_request;
     params.batch = n / params.qpr;
     params.padded_width = shifted ? ((w + params.qpr - 1 + 63) / 64) * 64 : w;
